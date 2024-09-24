@@ -35,9 +35,3 @@ fi
 ln -s /data/umbrel-os/var/log/ /var/log
 
 exec umbreld --data-directory /data
-
-
-
-
-
-
