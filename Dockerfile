@@ -62,8 +62,8 @@ RUN set -eu \
   && apt-get update -y \
   && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
   && apt-get --no-install-recommends -y install fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini apt-transport-https \
-  && curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null \
+  && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
   && apt-get update -y \
   && apt-get --no-install-recommends -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   && apt-get clean \
