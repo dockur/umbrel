@@ -30,7 +30,7 @@ services:
     ports:
       - 80:80
     volumes:
-      - "/var/umbrel:/data"
+      - "/data:/data"
       - "/var/run/docker.sock:/var/run/docker.sock"
     stop_grace_period: 1m
 ```
@@ -38,7 +38,7 @@ services:
 Via Docker CLI:
 
 ```bash
-docker run -it --rm -p 80:80 -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
+docker run -it --rm -p 80:80 -v /data:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
 
 ## Stars 🌟
