@@ -12,7 +12,7 @@
 
 </div></h1>
 
-Docker container of [UmbrelOS](https://umbrel.com/).
+Docker container of [UmbrelOS](https://umbrel.com/), removing the need for dedicated hardware!
 
 ## Features ✨
 
