@@ -269,13 +269,13 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
 // umbreld gets killed.
 
 export async function shutdown(): Promise<boolean> {
-	await $`poweroff`
+	await $`pkill -f umbreld`
 
 	return true
 }
 
 export async function reboot(): Promise<boolean> {
-	await $`reboot`
+	await $`pkill -f umbreld`
 
 	return true
 }
@@ -349,7 +349,7 @@ export async function hasWifi() {
 }
 
 export async function getWifiNetworks() {
-	throw new Error('Not supported')
+	return []
 }
 
 export async function deleteWifiConnections({inactiveOnly = false}: {inactiveOnly?: boolean}) {
@@ -357,7 +357,7 @@ export async function deleteWifiConnections({inactiveOnly = false}: {inactiveOnl
 }
 
 export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}) {
-  throw new Error('Not supported')
+	throw new Error('Not supported')
 }
 
 // Get IP addresses of the device
