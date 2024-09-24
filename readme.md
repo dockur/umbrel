@@ -1,6 +1,6 @@
 <h1 align="center">UmbrelOS<br />
 <div align="center">
-<a href="https://github.com/dockur/umbrel"><img src="https://raw.githubusercontent.com/dockur/umbrel/master/.github/logo.png" title="Logo" style="max-width:100%;" width="128" /></a>
+<a href="https://github.com/dockur/umbrel"><img src="https://raw.githubusercontent.com/dockur/umbrel/master/.github/logo.jpeg" title="Logo" style="max-width:100%;" width="256" /></a>
 </div>
 <div align="center">
 
@@ -40,6 +40,11 @@ Via Docker CLI:
 ```bash
 docker run -it --rm -p 80:80 -v /data:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
+
+> [!IMPORTANT]  
+> In order for this container to work correctly it's required that the binded `/data` folder is also called `/data` on your host.
+>
+> So do NOT modify the line `/data:/data`, you cannot use a custom location unfortunately.
 
 ## Stars 🌟
 [![Stars](https://starchart.cc/dockur/umbrel.svg?variant=adaptive)](https://starchart.cc/dockur/umbrel)
