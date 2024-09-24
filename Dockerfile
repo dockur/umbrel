@@ -52,6 +52,7 @@ FROM debian:bookworm-slim AS umbrelos
 ENV NODE_ENV=production
 
 ARG VERSION_ARG="0.0"
+ARG YQ_VERSION="v4.24.5"
 ARG DEBCONF_NOWARNINGS="yes"
 ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"
@@ -67,7 +68,9 @@ RUN set -eu \
   && apt-get --no-install-recommends -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-  && echo "$VERSION_ARG" > /run/version
+  && echo "$VERSION_ARG" > /run/version \
+  && wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64 \
+  && chmod +x /usr/local/bin/yq
 
 # Add Umbrel user
 RUN adduser --gecos "" --disabled-password umbrel \
