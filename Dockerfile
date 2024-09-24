@@ -58,7 +58,6 @@ ARG DEBCONF_NOWARNINGS="yes"
 ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
-# Install essential system utilities
 RUN set -eu \
   && apt-get update -y \
   && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
@@ -71,10 +70,8 @@ RUN set -eu \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
   && echo "$VERSION_ARG" > /run/version \
   && curl -sLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH} \
-  && chmod +x /usr/local/bin/yq
-
-# Add Umbrel user
-RUN adduser --gecos "" --disabled-password umbrel \
+  && chmod +x /usr/local/bin/yq \
+  && adduser --gecos "" --disabled-password umbrel \
   && echo "umbrel:umbrel" | chpasswd \
   && usermod -aG sudo umbrel
 
