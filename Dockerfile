@@ -48,8 +48,8 @@ ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
 # Install essential system utilities
 RUN apt-get update -y \
-  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode usbutils avahi-utils \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg avahi-daemon avahi-discover libnss-mdns procps \
+  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
+  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
