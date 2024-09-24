@@ -1,8 +1,12 @@
+FROM scratch AS base
+
+ADD https://github.com/getumbrel/umbrel.git /
+
 #########################################################################
 # ui build stage
 #########################################################################
 
-FROM node:18.19.1-buster-slim as ui-build
+FROM node:18.19.1-buster-slim AS ui-build
 
 # Install pnpm
 RUN npm install -g pnpm@8
@@ -11,7 +15,7 @@ RUN npm install -g pnpm@8
 WORKDIR /app
 
 # Copy the package.json and package-lock.json
-COPY packages/ui/ .
+COPY --from=base packages/ui/ .
 
 # Install the dependencies
 RUN rm -rf node_modules || true
@@ -48,7 +52,7 @@ RUN skopeo copy docker://getumbrel/auth-server@sha256:b4a4b37896911a85fb74fa159e
 
 # Install umbreld
 RUN apt-get install --yes npm
-COPY packages/umbreld /tmp/umbreld
+COPY --from=base packages/umbreld /tmp/umbreld
 COPY --from=ui-build /app/dist /tmp/umbreld/ui
 WORKDIR /tmp/umbreld
 RUN rm -rf node_modules || true
