@@ -1,6 +1,8 @@
 FROM scratch AS base
 
 ADD https://github.com/getumbrel/umbrel.git#1.2.2 /
+
+# Apply custom patches
 COPY source /packages/umbreld/source
 
 #########################################################################
@@ -46,47 +48,37 @@ RUN npm run build -- --native
 # umbrelos build stage
 #########################################################################
 
-FROM debian:bookworm AS umbrelos
+FROM debian:bookworm-slim AS umbrelos
 ENV NODE_ENV=production
 
+ARG VERSION_ARG="0.0"
 ARG DEBCONF_NOWARNINGS="yes"
 ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
 # Install essential system utilities
-RUN apt-get update -y \
+RUN set -eu \
+  && apt-get update -y \
   && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps skopeo \
+  && apt-get --no-install-recommends -y install fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini apt-transport-https \
+  && curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null \
+  && apt-get update -y \
+  && apt-get --no-install-recommends -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   && apt-get clean \
-  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
+  && echo "$VERSION_ARG" > /run/version
 
 # Add Umbrel user
 RUN adduser --gecos "" --disabled-password umbrel \
   && echo "umbrel:umbrel" | chpasswd \
   && usermod -aG sudo umbrel
 
-# Preload images
-RUN mkdir -p /images
-RUN skopeo copy docker://getumbrel/tor@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a docker-archive:/images/tor
-RUN skopeo copy docker://getumbrel/auth-server@sha256:b4a4b37896911a85fb74fa159e010129abd9dff751a40ef82f724ae066db3c2a docker-archive:/images/auth
-
 # Install umbreld
+COPY --chmod=755 ./entry.sh /run/
 COPY --from=be-build --chmod=755 /tmp/umbreld/build/umbreld /usr/local/bin/umbreld
 
-# Let umbreld provision the system
-# RUN umbreld provision-os
+VOLUME /data
+EXPOSE 80 443
 
-# Copy in filesystem overlay
-# COPY packages/os/overlay-common /
-# COPY "packages/os/overlay-${TARGETARCH}" /
-
-# Move persistant locations to /data to be bind mounted over the OS.
-# /data will exist on a seperate partition that survives OS updates.
-# This step should always be last so things like /var/log/apt/
-# exist while installing packages.
-# Migrataing current data is required to not break journald, otherwise
-# /var/log/journal will not exist and journald will log to RAM and not
-# persist between reboots.
-# RUN mkdir -p /data/umbrel-os/var
-# RUN mv /var/log     /data/umbrel-os/var/log
-# RUN mv /home        /data/umbrel-os/home
+ENTRYPOINT ["/usr/bin/tini", "-s", "/run/entry.sh"]
