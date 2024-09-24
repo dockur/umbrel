@@ -54,7 +54,7 @@ ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 # Install essential system utilities
 RUN apt-get update -y \
   && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps \
+  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps skopeo \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -64,9 +64,9 @@ RUN adduser --gecos "" --disabled-password umbrel \
   && usermod -aG sudo umbrel
 
 # Preload images
-# RUN mkdir -p /images
-# RUN skopeo copy docker://getumbrel/tor@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a docker-archive:/images/tor
-# RUN skopeo copy docker://getumbrel/auth-server@sha256:b4a4b37896911a85fb74fa159e010129abd9dff751a40ef82f724ae066db3c2a docker-archive:/images/auth
+RUN mkdir -p /images
+RUN skopeo copy docker://getumbrel/tor@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a docker-archive:/images/tor
+RUN skopeo copy docker://getumbrel/auth-server@sha256:b4a4b37896911a85fb74fa159e010129abd9dff751a40ef82f724ae066db3c2a docker-archive:/images/auth
 
 # Install umbreld
 COPY --from=be-build --chmod=755 /tmp/umbreld/build/umbreld /usr/local/bin/umbreld
