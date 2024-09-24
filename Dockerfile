@@ -51,6 +51,7 @@ RUN npm run build -- --native
 FROM debian:bookworm-slim AS umbrelos
 ENV NODE_ENV=production
 
+ARG TARGETARCH
 ARG VERSION_ARG="0.0"
 ARG YQ_VERSION="v4.24.5"
 ARG DEBCONF_NOWARNINGS="yes"
@@ -69,7 +70,7 @@ RUN set -eu \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
   && echo "$VERSION_ARG" > /run/version \
-  && wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64 \
+  && curl -sLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH} \
   && chmod +x /usr/local/bin/yq
 
 # Add Umbrel user
