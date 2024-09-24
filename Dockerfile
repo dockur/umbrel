@@ -6,7 +6,6 @@ ADD https://github.com/getumbrel/umbrel.git#1.2.2 /
 #########################################################################
 
 FROM node:18 AS ui-build
-ENV NODE_ENV=production
 
 # Install pnpm
 RUN npm install -g pnpm@8
@@ -29,7 +28,6 @@ RUN pnpm run build
 #########################################################################
 
 FROM node:18 AS be-build
-ENV NODE_ENV=production
 
 COPY --from=base packages/umbreld /tmp/umbreld
 COPY --from=ui-build /app/dist /tmp/umbreld/ui
@@ -71,7 +69,7 @@ RUN adduser --gecos "" --disabled-password umbrel \
 # RUN skopeo copy docker://getumbrel/auth-server@sha256:b4a4b37896911a85fb74fa159e010129abd9dff751a40ef82f724ae066db3c2a docker-archive:/images/auth
 
 # Install umbreld
-COPY --from=be-build /tmp/umbreld/build/umbreld /usr/local/bin/umbreld
+COPY --from=be-build --chmod=755 /tmp/umbreld/build/umbreld /usr/local/bin/umbreld
 
 # Let umbreld provision the system
 # RUN umbreld provision-os
