@@ -30,8 +30,15 @@ RUN pnpm run build
 
 FROM debian:bookworm AS umbrelos
 
+ARG DEBCONF_NOWARNINGS="yes"
+ARG DEBIAN_FRONTEND="noninteractive"
+ARG DEBCONF_NONINTERACTIVE_SEEN="true"
+
 # Install essential system utilities
-RUN apt-get install --yes sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode usbutils avahi-utils
+RUN apt-get update -y \
+  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode usbutils avahi-utils \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Add Umbrel user
 RUN adduser --gecos "" --disabled-password umbrel
