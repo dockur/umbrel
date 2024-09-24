@@ -1,5 +1,7 @@
 FROM scratch AS base
+
 ADD https://github.com/getumbrel/umbrel.git#1.2.2 /
+COPY index.ts /packages/umbreld/source/index.ts
 
 #########################################################################
 # ui build stage
