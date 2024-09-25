@@ -98,6 +98,7 @@ async function getLatestRelease(umbreld: Umbreld) {
 		headers: {'User-Agent': `umbrelOS ${umbreld.version}`},
 	})
 	const data = await result.json()
+	umbreld.logger.error(`data: ${data}`)
 	return data as {version: string; name: string; releaseNotes: string; updateScript?: string}
 }
 
