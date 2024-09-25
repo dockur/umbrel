@@ -12,11 +12,11 @@
 
 </div></h1>
 
-Docker container of [UmbrelOS](https://umbrel.com/), removing the need for dedicated hardware!
+Docker container of [UmbrelOS](https://umbrel.com/), making it possible to run it everywhere instead of needing a dedicated device.
 
 ## Features ✨
 
-* No dedicated hardware or virtual machine required!
+* Does not need dedicated hardware or a virtual machine!
 
 ## Usage  🐳
 
