@@ -275,7 +275,7 @@ export async function shutdown(): Promise<boolean> {
 }
 
 export async function reboot(): Promise<boolean> {
-	await $`pkill -f umbreld`
+	await $`pkill -USR1 -f umbreld`
 
 	return true
 }
