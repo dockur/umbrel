@@ -281,8 +281,7 @@ export async function reboot(): Promise<boolean> {
 }
 
 export async function commitOsPartition(umbreld: Umbreld): Promise<boolean> {
-	umbreld.logger.error(`Failed to commit OS partition`)
-	return false
+	return true
 }
 
 export async function detectDevice() {
