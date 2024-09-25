@@ -59,10 +59,10 @@ async function cleanShutdown(signal: string) {
 
 	umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
 	await umbreld.stop()
-	process.exit(0)
 }
 process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
 process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
+process.on('SIGUSR1', umbreld.logger.log('Received SIGUSR'))
 
 try {
 	await umbreld.start()
