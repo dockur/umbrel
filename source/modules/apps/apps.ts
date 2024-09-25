@@ -25,6 +25,32 @@ export default class Apps {
 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
 	}
 
+	// This is a really brutal and heavy handed way of cleaning up old Docker state.
+	// We should only do this sparingly. It's needed if an old version of Docker
+	// didn't shutdown cleanly and then we update to a new version of Docker.
+	// The next version of Docker can have issues starting containers if the old
+	// containers/networks are still hanging around. We had this issue because sometimes
+	// 0.5.4 installs didn't clean up properly on shutdown and it causes critical errors
+	// bringing up containers in 1.0.
+	async cleanDockerState() {
+		try {
+			const containerIds = (await $`docker ps -aq --filter label=com.docker.compose.project=umbrel`).stdout.split('\n').filter(Boolean)
+			if (containerIds.length) {
+				this.logger.log('Cleaning up old containers...')
+				await $({stdio: 'inherit'})`docker stop --time 60 ${containerIds}`
+				await $({stdio: 'inherit'})`docker rm ${containerIds}`
+			}
+		} catch (error) {
+			this.logger.error(`Failed to clean containers: ${(error as Error).message}`)
+		}
+		try {
+			this.logger.log('Cleaning up old networks...')
+			await $({stdio: 'inherit'})`docker network prune -f --filter label=com.docker.compose.project=umbrel`
+		} catch (error) {
+			this.logger.error(`Failed to clean networks: ${(error as Error).message}`)
+		}
+	}
+
 	async start() {
 		// Set apps to empty array on first start
 		if ((await this.#umbreld.store.get('apps')) === undefined) {
@@ -106,6 +132,8 @@ export default class Apps {
 				await appEnvironment(this.#umbreld, 'up')
 			} catch (error) {
 				this.logger.error(`Failed to start app environment: ${(error as Error).message}`)
+				this.logger.log('Attempting to clean Docker state before retrying...')
+				await this.cleanDockerState()
 			}
 			await pRetry(() => appEnvironment(this.#umbreld, 'up'), {
 				onFailedAttempt: (error) => {
@@ -162,7 +190,7 @@ export default class Apps {
 			},
 			retries: 2,
 		})
-
+		
 		this.logger.log('Successfully stopped all apps...')
 	}
 
