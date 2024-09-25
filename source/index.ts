@@ -15,6 +15,9 @@ import Server from './modules/server/index.js'
 import User from './modules/user.js'
 import AppStore from './modules/apps/app-store.js'
 import Apps from './modules/apps/apps.js'
+import {detectDevice, setCpuGovernor, connectToWiFiNetwork} from './modules/system.js'
+
+import {commitOsPartition} from './modules/system.js'
 
 type StoreSchema = {
 	version: string
@@ -79,6 +82,68 @@ export default class Umbreld {
 		this.apps = new Apps(this)
 	}
 
+	// TODO: Move this to a system module
+	// Restore WiFi after OTA update
+	async restoreWiFi() {
+		const wifiCredentials = await this.store.get('settings.wifi')
+		if (!wifiCredentials) return
+
+		while (true) {
+			this.logger.log(`Attempting to restore WiFi connection to ${wifiCredentials.ssid}...`)
+			try {
+				await connectToWiFiNetwork(wifiCredentials)
+				this.logger.log(`WiFi connection restored!`)
+				break
+			} catch (error) {
+				this.logger.error(`Failed to restore WiFi connection "${(error as Error).message}". Retrying in 1 minute...`)
+				await setTimeout(1000 * 60)
+			}
+		}
+	}
+
+	async setupPiCpuGoverner() {
+		// TODO: Move this to a system module
+		// Set ondemand cpu governer for Raspberry Pi
+		try {
+			const {productName} = await detectDevice()
+			if (productName === 'Raspberry Pi') {
+				await setCpuGovernor('ondemand')
+				this.logger.log(`Set ondemand cpu governor`)
+			}
+		} catch (error) {
+			this.logger.error(`Failed to set ondemand cpu governor: ${(error as Error).message}`)
+		}
+	}
+
+	// Wait for system time to be synced for up to the number of seconds passed in.
+	// We need this on Raspberry Pi since it doesn' have a persistent real time clock.
+	// It avoids race conditions where umbrelOS starts making network requests before
+	// the local time is set which then fail with SSL cert errors.
+	async waitForSystemTime(timeout: number) {
+		try {
+			// Only run on Pi
+			const {deviceId} = await detectDevice()
+			if (!['pi-4', 'pi-5'].includes(deviceId)) return
+
+			this.logger.log('Checking if system time is synced before continuing...')
+			let tries = 0
+			while (tries < timeout) {
+				tries++
+				const timeStatus = await $`timedatectl status`
+				const isSynced = timeStatus.stdout.includes('System clock synchronized: yes')
+				if (isSynced) {
+					this.logger.log('System time is synced. Continuing...')
+					return
+				}
+				this.logger.log('System time is not currently synced, waiting...')
+				await setTimeout(1000)
+			}
+			this.logger.error('System time is not synced but timeout was reached. Continuing...')
+		} catch (error) {
+			this.logger.error(`Failed to check system time: ${(error as Error).message}`)
+		}
+	}
+
 	async start() {
 		this.logger.log(`☂️  Starting Umbrel v${this.version}`)
 		this.logger.log()
@@ -87,11 +152,23 @@ export default class Umbreld {
 		this.logger.log(`logLevel:      ${this.logLevel}`)
 		this.logger.log()
 
+		// If we've successfully booted then commit to the current OS partition
+		commitOsPartition(this)
+
+		// Set ondemand cpu governer for Raspberry Pi
+		this.setupPiCpuGoverner()
+
 		// Run migration module before anything else
 		// TODO: think through if we want to allow the server module to run before migration.
 		// It might be useful if we add more complicated migrations so we can signal progress.
 		await this.migration.start()
-	
+
+		// Restore WiFi connection after OTA update
+		this.restoreWiFi()
+
+		// Wait for system time to be synced for up to 10 seconds before proceeding
+		await this.waitForSystemTime(10)
+
 		// We need to forcefully clean Docker state before being able to safely continue
 		// If an existing container is listening on port 80 we'll crash, if an old version
 		// of Umbrel wasn't shutdown properly, bringing containers up can fail.
@@ -102,7 +179,7 @@ export default class Umbreld {
 				.cleanDockerState()
 				.catch((error) => this.logger.error(`Failed to clean Docker state: ${(error as Error).message}`))
 		}
-	
+
 		// Initialise modules
 		await Promise.all([this.apps.start(), this.appStore.start(), this.server.start()])
 	}
