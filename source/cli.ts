@@ -58,22 +58,11 @@ async function cleanShutdown(signal: string) {
 	isShuttingDown = true
 
 	umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
-        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-        let i = 0;
-        while(true){
-            await sleep(1000);//1000ms
-            i++;
-            umbreld.logger.log('Infinite Loop Test n:', i);
-        }
-
+	await umbreld.stop()
+	process.exit(0)
 }
 process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
 process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
-
-async function doShutdown(signal: string) {
-        umbreld.logger.log('Received SIGUSR')
-}
-process.on('SIGUSR1', doShutdown.bind(null, 'SIGUSR1'))
 
 try {
 	await umbreld.start()
