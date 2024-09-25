@@ -21,4 +21,6 @@ fi
 
 ln -s /data/umbrel-os/var/log/ /var/log
 
-exec umbreld --data-directory /data
+trap "while pgrep umbreld >/dev/null; do sleep 1; done" SIGINT
+
+umbreld --data-directory /data & wait $!
