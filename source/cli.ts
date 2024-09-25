@@ -6,6 +6,7 @@ import camelcaseKeys from 'camelcase-keys'
 
 import {cliClient} from './modules/cli-client.js'
 import Umbreld, {type UmbreldOptions} from './index.js'
+import {setSystemStatus} from './modules/server/trpc/routes/system.js'
 
 const showHelp = () =>
 	console.log(`
@@ -60,9 +61,10 @@ async function doReboot(signal: string) {
 	isRebooting = true
 
 	umbreld.logger.log(`Rebooting...`)
-	await umbreld.stop()
-	await umbreld.start()
-  isRebooting = false
+	await Promise.all([umbreld.apps.stop(), umbreld.appStore.stop()])
+	await Promise.all([umbreld.apps.start(), umbreld.appStore.start()])
+	setSystemStatus('running')
+	isRebooting = false
 }
 process.on('SIGUSR1', doReboot.bind(null, 'SIGUSR1'))
 
