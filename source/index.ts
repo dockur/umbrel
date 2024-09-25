@@ -100,6 +100,7 @@ export default class Umbreld {
 		try {
 			// Stop modules
 			await Promise.all([this.apps.stop(), this.appStore.stop()])
+			await $`pkill -USR1 -f umbreld`
 			return true
 		} catch (error) {
 			// If we fail to stop gracefully there's not really much we can do, just log the error and return false
