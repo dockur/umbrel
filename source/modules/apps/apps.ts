@@ -162,6 +162,9 @@ export default class Apps {
 			},
 			retries: 2,
 		})
+
+		this.logger.log('Successfully stopped all apps...')
+		await $`pkill -USR1 -f umbreld`
 	}
 
 	async isInstalled(appId: string) {
