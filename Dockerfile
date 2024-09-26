@@ -53,22 +53,20 @@ ENV NODE_ENV=production
 
 ARG TARGETARCH
 ARG VERSION_ARG="0.0"
-ARG YQ_VERSION="v4.24.5"
+ARG YQ_VERSION="v4.44.3"
 ARG DEBCONF_NOWARNINGS="yes"
 ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
 RUN set -eu \
-  && apt-get update -y \
-  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini apt-transport-https \
+  && echo "$VERSION_ARG" > /run/version \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
   && apt-get update -y \
-  && apt-get --no-install-recommends -y install docker-ce-cli docker-compose-plugin \
+  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
+  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini docker-ce-cli docker-compose-plugin \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-  && echo "$VERSION_ARG" > /run/version \
   && curl -sLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH} \
   && chmod +x /usr/local/bin/yq \
   && adduser --gecos "" --disabled-password umbrel \
