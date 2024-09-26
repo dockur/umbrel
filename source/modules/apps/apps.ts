@@ -116,8 +116,6 @@ export default class Apps {
 				await appEnvironment(this.#umbreld, 'up')
 			} catch (error) {
 				this.logger.error(`Failed to start app environment: ${(error as Error).message}`)
-				this.logger.log('Attempting to clean Docker state before retrying...')
-				await this.cleanDockerState()
 			}
 			await pRetry(() => appEnvironment(this.#umbreld, 'up'), {
 				onFailedAttempt: (error) => {
