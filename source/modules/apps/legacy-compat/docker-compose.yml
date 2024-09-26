@@ -1,0 +1,44 @@
+version: '3.7'
+
+services:
+  tor_proxy:
+    container_name: tor_proxy
+    image: getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a
+    user: '1000:1000'
+    restart: on-failure
+    volumes:
+      - ${UMBREL_TORRC}:/etc/tor/torrc:ro
+      - ${UMBREL_DATA_DIR}/tor/data:/data
+    environment:
+      HOME: '/tmp'
+    networks:
+      umbrel_main_network:
+        ipv4_address: $TOR_PROXY_IP
+  auth:
+    container_name: auth
+    image: getumbrel/auth-server:1.0.5@sha256:b4a4b37896911a85fb74fa159e010129abd9dff751a40ef82f724ae066db3c2a
+    user: '1000:1000'
+    # build:
+    #   dockerfile: containers/app-auth/Dockerfile
+    #   context: ../../../../../../
+    restart: on-failure
+    environment:
+      PORT: $AUTH_PORT
+      UMBREL_AUTH_SECRET: $UMBREL_AUTH_SECRET
+      MANAGER_IP: $MANAGER_IP
+      MANAGER_PORT: 3006
+      DASHBOARD_IP: $DASHBOARD_IP
+      DASHBOARD_PORT: 3004
+      JWT_SECRET: $JWT_SECRET
+      UMBRELD_RPC_HOST: $UMBRELD_RPC_HOST
+    volumes:
+      - ${UMBREL_DATA_DIR}/tor/data:/var/lib/tor:ro
+      - ${UMBREL_DATA_DIR}/app-data:/app-data:ro
+      - ${UMBREL_DATA_DIR}:/data:ro
+    ports:
+      - '${AUTH_PORT}:${AUTH_PORT}'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    networks:
+      umbrel_main_network:
+        ipv4_address: $AUTH_IP
