@@ -38,6 +38,7 @@ services:
 
 networks:
   umbrel_main_network:
+    name: umbrel_main_network
     ipam:
       driver: default
       config:
