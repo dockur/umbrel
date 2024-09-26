@@ -28,8 +28,9 @@ async function writeYaml(path: string, data: any) {
 async function patchYaml(path: string) {
 	let yaml = await fse.readFile(path, 'utf8')
 
-	if (!yaml.includes('$APP_LIGHTNING_NODE_REST_PORT')) return true
-	yaml = yaml.replace('$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT', '8558:$APP_LIGHTNING_NODE_REST_PORT');
+	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
+	if (!yaml.includes(find)) return true
+	yaml = yaml.replace(find, '8558:$APP_LIGHTNING_NODE_REST_PORT');
 
 	await fse.writeFile(path, yaml)
 	return true
@@ -120,7 +121,7 @@ export default class App {
 		}
 
 		await this.writeCompose(compose)
-		await this.pathCompose()
+		await this.patchCompose()
 	}
 
 	async pull() {
