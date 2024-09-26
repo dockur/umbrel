@@ -59,16 +59,18 @@ ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
 RUN set -eu \
-  && echo "$VERSION_ARG" > /run/version \
+  && apt-get update -y \
+  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
+  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
   && apt-get update -y \
-  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns procps tini docker-ce-cli docker-compose-plugin \
+  && apt-get --no-install-recommends -y install docker-ce-cli docker-compose-plugin \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
   && curl -sLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH} \
   && chmod +x /usr/local/bin/yq \
+  && echo "$VERSION_ARG" > /run/version \
   && adduser --gecos "" --disabled-password umbrel \
   && echo "umbrel:umbrel" | chpasswd \
   && usermod -aG sudo umbrel
