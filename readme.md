@@ -29,20 +29,10 @@ services:
     container_name: umbrel
     ports:
       - 80:80
-    networks:
-       - umbrel_main_network
     volumes:
       - "/data:/data"
       - "/var/run/docker.sock:/var/run/docker.sock"
     stop_grace_period: 1m
-
-networks:
-  umbrel_main_network:
-    name: umbrel_main_network
-    ipam:
-      driver: default
-      config:
-        - subnet: '10.21.0.0/16'
 ```
 
 > [!IMPORTANT]  
