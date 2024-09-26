@@ -33,22 +33,6 @@ export default class Apps {
 	// 0.5.4 installs didn't clean up properly on shutdown and it causes critical errors
 	// bringing up containers in 1.0.
 	async cleanDockerState() {
-		try {
-			const containerIds = (await $`docker ps -aq --filter label=com.docker.compose.project=umbrel`).stdout.split('\n').filter(Boolean)
-			if (containerIds.length) {
-				this.logger.log('Cleaning up old containers...')
-				await $({stdio: 'inherit'})`docker stop --time 60 ${containerIds}`
-				await $({stdio: 'inherit'})`docker rm ${containerIds}`
-			}
-		} catch (error) {
-			this.logger.error(`Failed to clean containers: ${(error as Error).message}`)
-		}
-		try {
-			this.logger.log('Cleaning up old networks...')
-			await $({stdio: 'inherit'})`docker network prune -f --filter label=com.docker.compose.project=umbrel`
-		} catch (error) {
-			this.logger.error(`Failed to clean networks: ${(error as Error).message}`)
-		}
 	}
 
 	async start() {
