@@ -7,19 +7,9 @@ fi
 
 # Create directories
 mkdir -p /images
-mkdir -p /data/umbrel-os/var
-
-if [ ! -d /data/umbrel-os/home ]; then
-  cp -r /home /data/umbrel-os/
-fi
-
-ln -s /data/umbrel-os/home/ /home
-
-if [ ! -d /data/umbrel-os/var/log ]; then
-  cp -r /var/log /data/umbrel-os/var/
-fi
-
-ln -s /data/umbrel-os/var/log/ /var/log
+mkdir -p /data/umbrel-os/tor
+mkdir -p /data/umbrel-os/home
+mkdir -p /data/umbrel-os/var/log
 
 trap "pkill -SIGINT -f umbreld; while pgrep umbreld >/dev/null; do sleep 1; done" SIGINT SIGTERM
 
