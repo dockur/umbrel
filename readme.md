@@ -29,16 +29,19 @@ services:
     container_name: umbrel
     ports:
       - 80:80
+    networks:
+       - umbrel_main_network
     volumes:
       - "/data:/data"
       - "/var/run/docker.sock:/var/run/docker.sock"
     stop_grace_period: 1m
-```
 
-Via Docker CLI:
-
-```bash
-docker run -it --rm -p 80:80 -v /data:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
+networks:
+  umbrel_main_network:
+    ipam:
+      driver: default
+      config:
+        - subnet: '10.21.0.0/16'
 ```
 
 > [!IMPORTANT]  
