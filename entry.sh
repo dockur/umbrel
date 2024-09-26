@@ -5,14 +5,41 @@ if [ ! -S /var/run/docker.sock ]; then
   echo "ERROR: Docker socket is missing? Please bind /var/run/docker.sock in your compose file." && exit 13
 fi
 
-if ! docker network inspect umbrel_main_network >/dev/null; then
+if ! docker network inspect umbrel_main_network &>/dev/null; then
   docker network create --driver=bridge --subnet="10.21.0.0/16" umbrel_main_network
-  if ! docker network inspect umbrel_main_network >/dev/null; then
+  if ! docker network inspect umbrel_main_network &>/dev/null; then
     echo "ERROR: Network 'umbrel_main_network' does not exist?" && exit 14
   fi
 fi
 
-docker network connect umbrel_main_network umbrels
+target=$(hostname)
+
+if ! docker inspect "$target" &>/dev/null; then
+
+  containers=$(sudo docker ps | awk '{if(NR>1) print $NF}')
+
+  for container in $containers
+  do
+    resp=$(docker inspect "$container")
+    if [[ "${resp,,}" == *"\"/data:/data\""* ]] ;then
+      target="$container"
+      break
+    fi
+  done
+
+fi
+
+if ! docker inspect "$target" &>/dev/null; then
+  echo "ERROR: Failed to find container!" && exit 15
+fi
+
+resp=$(docker inspect "$target")
+
+if [[ "${resp,,}" != *"umbrel_main_network"* ]] ;then
+  if ! docker network connect umbrel_main_network "$target"; then
+    echo "ERROR: Failed to connect container to network!" && exit 16
+  fi
+fi
 
 # Create directories
 mkdir -p /images
