@@ -7,9 +7,9 @@ fi
 
 # Create directories
 mkdir -p /images
+mkdir -p /data/tor/
 mkdir -p /data/umbrel-os/home
 mkdir -p /data/umbrel-os/var/log
-mkdir -p /data/umbrel-os/tor/data
 
 trap "pkill -SIGINT -f umbreld; while pgrep umbreld >/dev/null; do sleep 1; done" SIGINT SIGTERM
 
