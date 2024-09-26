@@ -1,4 +1,4 @@
-FROM scratch AS base
+FROM --platform=$BUILDPLATFORM scratch AS base
 
 ADD https://github.com/getumbrel/umbrel.git#1.2.2 /
 
@@ -9,7 +9,7 @@ COPY source /packages/umbreld/source
 # ui build stage
 #########################################################################
 
-FROM node:18 AS ui-build
+FROM --platform=$BUILDPLATFORM node:18 AS ui-build
 
 # Install pnpm
 RUN npm install -g pnpm@8
