@@ -23,7 +23,7 @@ if ! docker inspect "$target" &>/dev/null; then
   for container in $containers
   do
     resp=$(docker inspect "$container")
-    if [[ "${resp,,}" == *"\"/data:/data\""* ]] ;then
+    if [[ "${resp,,}" == *"\"/data:/data\""* ]] || [[ "${resp,,}" == *"\"/data:/data:"* ]]; then
       target="$container"
       break
     fi
@@ -43,7 +43,7 @@ if [[ "${resp,,}" != *"umbrel_main_network"* ]] ;then
   fi
 fi
 
-if [[ "${resp,,}" != *"\"/data:/data\""* ]] ;then
+if [[ "${resp,,}" != *"\"/data:/data\""* ]] && [[ "${resp,,}" != *"\"/data:/data:"* ]]; then
   echo "ERROR: You did not bind the /data:/data folder!" && exit 18
 fi
 
