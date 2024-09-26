@@ -2,7 +2,11 @@
 set -Eeuo pipefail
 
 if [ ! -S /var/run/docker.sock ]; then
-  echo "ERROR: Docker socket is missing? Please bind /var/run/docker.sock in your compose file." && exit  13
+  echo "ERROR: Docker socket is missing? Please bind /var/run/docker.sock in your compose file." && exit 13
+fi
+
+if ! docker network inspect umbrel_main_network; then
+  echo "ERROR: Network 'umbrel_main_network' does not exist? Please check your compose file." && exit 14
 fi
 
 # Create directories
