@@ -1,0 +1,3 @@
+networks:
+  umbrel_main_network:
+    external: true
