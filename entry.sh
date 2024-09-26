@@ -41,6 +41,10 @@ if [[ "${resp,,}" != *"umbrel_main_network"* ]] ;then
   fi
 fi
 
+if [[ "${resp,,}" != *"\"/data:/data\""* ]] ;then
+  echo "ERROR: You did not bind the /data:/data folder!" && exit 17
+fi
+
 # Create directories
 mkdir -p /images
 mkdir -p /data/tor/
