@@ -25,6 +25,16 @@ async function writeYaml(path: string, data: any) {
 	return fse.writeFile(path, yaml.dump(data))
 }
 
+async function patchYaml(path: string) {
+	let yaml = await fse.readFile(path, 'utf8')
+
+	if (!yaml.includes('$APP_LIGHTNING_NODE_REST_PORT')) return true
+	yaml = yaml.replace('$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT', '8558:$APP_LIGHTNING_NODE_REST_PORT');
+
+	await fse.writeFile(path, yaml)
+	return true
+}
+
 type AppState =
 	| 'unknown'
 	| 'installing'
@@ -69,6 +79,10 @@ export default class App {
 		return readYaml(`${this.dataDirectory}/docker-compose.yml`) as Promise<Compose>
 	}
 
+	patchCompose() {
+		return patchYaml(`${this.dataDirectory}/docker-compose.yml`)
+	}
+
 	async readHiddenService() {
 		try {
 			return await fse.readFile(`${this.#umbreld.dataDirectory}/tor/data/app-${this.id}/hostname`, 'utf-8')
@@ -106,6 +120,7 @@ export default class App {
 		}
 
 		await this.writeCompose(compose)
+		await this.pathCompose()
 	}
 
 	async pull() {
