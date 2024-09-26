@@ -6,9 +6,11 @@ if [ ! -S /var/run/docker.sock ]; then
 fi
 
 if ! docker network inspect umbrel_main_network &>/dev/null; then
-  docker network create --driver=bridge --subnet="10.21.0.0/16" umbrel_main_network
+  if ! docker network create --driver=bridge --subnet="10.21.0.0/16" umbrel_main_network >/dev/null; then
+    echo "ERROR: Failed to create network 'umbrel_main_network'!" && exit 14
+  fi
   if ! docker network inspect umbrel_main_network &>/dev/null; then
-    echo "ERROR: Network 'umbrel_main_network' does not exist?" && exit 14
+    echo "ERROR: Network 'umbrel_main_network' does not exist?" && exit 15
   fi
 fi
 
@@ -30,19 +32,19 @@ if ! docker inspect "$target" &>/dev/null; then
 fi
 
 if ! docker inspect "$target" &>/dev/null; then
-  echo "ERROR: Failed to find container!" && exit 15
+  echo "ERROR: Failed to find container!" && exit 16
 fi
 
 resp=$(docker inspect "$target")
 
 if [[ "${resp,,}" != *"umbrel_main_network"* ]] ;then
   if ! docker network connect umbrel_main_network "$target"; then
-    echo "ERROR: Failed to connect container to network!" && exit 16
+    echo "ERROR: Failed to connect container to network!" && exit 17
   fi
 fi
 
 if [[ "${resp,,}" != *"\"/data:/data\""* ]] ;then
-  echo "ERROR: You did not bind the /data:/data folder!" && exit 17
+  echo "ERROR: You did not bind the /data:/data folder!" && exit 18
 fi
 
 # Create directories
