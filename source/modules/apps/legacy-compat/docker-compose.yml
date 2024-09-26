@@ -44,6 +44,5 @@ services:
         ipv4_address: $AUTH_IP
 
 networks:
-  default:
-    external:
-      name: umbrel_main_network
+  umbrel_main_network:
+    external: true
