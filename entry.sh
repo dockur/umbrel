@@ -6,8 +6,13 @@ if [ ! -S /var/run/docker.sock ]; then
 fi
 
 if ! docker network inspect umbrel_main_network >/dev/null; then
-  echo "ERROR: Network 'umbrel_main_network' does not exist? Please check your compose file." && exit 14
+  docker network create --driver=bridge --subnet="10.21.0.0/16" umbrel_main_network
+  if ! docker network inspect umbrel_main_network >/dev/null; then
+    echo "ERROR: Network 'umbrel_main_network' does not exist?" && exit 14
+  fi
 fi
+
+docker network connect umbrel_main_network umbrels
 
 # Create directories
 mkdir -p /images
