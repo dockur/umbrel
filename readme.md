@@ -35,7 +35,13 @@ services:
     stop_grace_period: 1m
 ```
 
-> [!IMPORTANT]  
+Via Docker CLI:
+
+```bash
+docker run -it --rm -p 80:80 -v /data:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
+```
+
+> [!IMPORTANT]
 > In order for this container to work correctly, it's required that the binded `/data` folder is also called `/data` on your host.
 >
 > So do NOT modify the line `/data:/data`, you cannot use a custom location unfortunately.
