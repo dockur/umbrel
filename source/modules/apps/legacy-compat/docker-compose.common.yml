@@ -1,3 +1,4 @@
 networks:
-  umbrel_main_network:
-    external: true
+  default:
+    external:
+      name: umbrel_main_network
