@@ -1,0 +1,26 @@
+services:
+  app_proxy:
+    image: getumbrel/app-proxy:1.0.0@sha256:49eb600c4667c4b948055e33171b42a509b7e0894a77e0ca40df8284c77b52fb
+    # build: ../../../../../../containers/app-proxy
+    user: '1000:1000'
+    restart: on-failure
+    hostname: $APP_PROXY_HOSTNAME
+    ports:
+      - '${APP_PROXY_PORT}:${APP_PROXY_PORT}'
+    volumes:
+      - '${APP_MANIFEST_FILE}:/extra/umbrel-app.yml:ro'
+      - '${TOR_DATA_DIR}:/var/lib/tor:ro'
+      - '${APP_DATA_DIR}:/data:ro'
+    environment:
+      LOG_LEVEL: info
+      PROXY_PORT: $APP_PROXY_PORT
+      PROXY_AUTH_ADD: 'true'
+      PROXY_AUTH_WHITELIST:
+      PROXY_AUTH_BLACKLIST:
+      APP_HOST:
+      APP_PORT:
+      AUTH_SERVICE_PORT: $AUTH_PORT
+      UMBREL_AUTH_SECRET: $UMBREL_AUTH_SECRET
+      MANAGER_IP: $MANAGER_IP
+      MANAGER_PORT: 3006
+      JWT_SECRET: $JWT_SECRET
