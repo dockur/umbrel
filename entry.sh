@@ -35,9 +35,7 @@ if [ -z "$mount" ] || [[ "$mount" == "null" ]]; then
   echo "ERROR: You did not bind the /data folder!" && exit 18
 fi
 
-# Create directories
 mkdir -p "/images"
-mkdir -p "$mount/tor"
 
 trap "pkill -SIGINT -f umbreld; while pgrep umbreld >/dev/null; do sleep 1; done" SIGINT SIGTERM
 
