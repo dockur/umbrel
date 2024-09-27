@@ -23,7 +23,7 @@ fi
 resp=$(docker inspect "$target")
 network=$(echo "$resp" | jq -r '.[0].NetworkSettings.Networks["umbrel_main_network"]')
 
-if [ -z "$network" ]; then
+if [ -z "$network" ] || [[ "$network" == "null" ]]; then
   if ! docker network connect umbrel_main_network "$target"; then
     echo "ERROR: Failed to connect container to network!" && exit 17
   fi
@@ -31,7 +31,7 @@ fi
 
 mount=$(echo "$resp" | jq -r '.[0].Mounts[] | select(.Destination == "/data").Source')
 
-if [ -z "$mount" ]; then
+if [ -z "$mount" ] || [[ "$mount" == "null" ]]; then
   echo "ERROR: You did not bind the /data folder!" && exit 18
 fi
 
