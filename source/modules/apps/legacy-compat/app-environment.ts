@@ -2,6 +2,7 @@ import {fileURLToPath} from 'node:url'
 import {dirname, join} from 'node:path'
 
 import {$} from 'execa'
+import fse from 'fs-extra'
 
 import type Umbreld from '../../../index.js'
 
@@ -34,9 +35,8 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 		},
 	}
 	if (command === 'up') {
-		await `mkdir -p ${umbreld.dataDirectory}/tor`
- 		await `cp ${currentDirname}/tor-proxy-torrc ${umbreld.dataDirectory}/tor/tor-proxy-torrc`
-		await `cp ${currentDirname}/tor-server-torrc ${umbreld.dataDirectory}/tor/tor-server-torrc`
+                await fse.copy(`${currentDirname}/tor-proxy-torrc`, `/data/tor/tor-proxy-torrc`)
+                await fse.copy(`${currentDirname}/tor-server-torrc`, `/data/tor/tor-server-torrc`)
 		await $(
 			options as any,
 		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
