@@ -30,10 +30,16 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 			JWT_SECRET: await umbreld.server.getJwtSecret(),
 			UMBRELD_RPC_HOST: `host.docker.internal:${umbreld.server.port}`, // TODO: Check host.docker.internal works on linux
 			UMBREL_LEGACY_COMPAT_DIR: currentDirname,
-			UMBREL_TORRC: torEnabled ? `${currentDirname}/tor-server-torrc` : `${currentDirname}/tor-proxy-torrc`,
+			UMBREL_TORRC: torEnabled ? `${umbreld.dataDirectory}/tor/tor-server-torrc` : `${umbreld.dataDirectory}/tor/tor-proxy-torrc`,
 		},
 	}
 	if (command === 'up') {
+		await `mkdir -p ${umbreld.dataDirectory}/tor`
+		if (!torEnabled) {
+			await `cp ${currentDirname}/tor-proxy-torrc ${umbreld.dataDirectory}/tor/tor-proxy-torrc`
+		} else {
+			await `cp ${currentDirname}/tor-server-torrc ${umbreld.dataDirectory}/tor/tor-server-torrc`
+		}	
 		await $(
 			options as any,
 		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
