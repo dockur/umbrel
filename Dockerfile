@@ -36,6 +36,7 @@ FROM node:18 AS be-build
 COPY --from=base packages/umbreld /tmp/umbreld
 COPY --from=ui-build /app/dist /tmp/umbreld/ui
 WORKDIR /tmp/umbreld
+RUN chmod +x /tmp/umbreld/source/modules/apps/legacy-compat/app-script
 
 # Install the dependencies
 RUN rm -rf node_modules || true
