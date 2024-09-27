@@ -157,7 +157,7 @@ source_app() {
 
   # Tor specific exports
   export TOR_DATA_DIR="${UMBREL_ROOT}/tor/data"
-  export TOR_ENTRYPOINT_SCRIPT="/data/tor/tor-entrypoint.sh"
+  export TOR_ENTRYPOINT_SCRIPT="${UMBREL_ROOT}/tor/tor-entrypoint.sh"
   export TOR_HS_APP_DIR="/data/app-${app}"
   export TOR_HS_PORTS="80:${APP_PROXY_HOSTNAME}:${APP_PROXY_PORT}"
 
