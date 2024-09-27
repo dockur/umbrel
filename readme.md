@@ -30,7 +30,7 @@ services:
     ports:
       - 80:80
     volumes:
-      - "/data:/data"
+      - "/home/example:/data"
       - "/var/run/docker.sock:/var/run/docker.sock"
     stop_grace_period: 1m
 ```
