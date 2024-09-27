@@ -35,11 +35,8 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 	}
 	if (command === 'up') {
 		await `mkdir -p ${umbreld.dataDirectory}/tor`
-		if (!torEnabled) {
-			await `cp ${currentDirname}/tor-proxy-torrc ${umbreld.dataDirectory}/tor/tor-proxy-torrc`
-		} else {
-			await `cp ${currentDirname}/tor-server-torrc ${umbreld.dataDirectory}/tor/tor-server-torrc`
-		}	
+ 		await `cp ${currentDirname}/tor-proxy-torrc ${umbreld.dataDirectory}/tor/tor-proxy-torrc`
+		await `cp ${currentDirname}/tor-server-torrc ${umbreld.dataDirectory}/tor/tor-server-torrc`
 		await $(
 			options as any,
 		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
