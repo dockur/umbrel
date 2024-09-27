@@ -273,7 +273,7 @@ compose() {
   # If remote Tor access is enabled
   # Then include a compose file for Tor
   if [[ "${REMOTE_TOR_ACCESS}" == "true" ]]; then
-    rm -f "$TOR_ENTRYPOINT_SCRIPT" ]
+    rm -f "$TOR_ENTRYPOINT_SCRIPT"
     mkdir -p /data/tor
     cp "${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh" "$TOR_ENTRYPOINT_SCRIPT"
     chmod +x "$TOR_ENTRYPOINT_SCRIPT"
