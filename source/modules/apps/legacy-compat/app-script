@@ -274,8 +274,11 @@ compose() {
   # Then include a compose file for Tor
   if [[ "${REMOTE_TOR_ACCESS}" == "true" ]]; then
     mkdir -p /data/tor
-    cp "${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh" "$TOR_ENTRYPOINT_SCRIPT"
-    chmod +x "$TOR_ENTRYPOINT_SCRIPT"
+    echo "COPY ${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh $TOR_ENTRYPOINT_SCRIPT"
+    if [ ! -f "$TOR_ENTRYPOINT_SCRIPT" ]; then
+      cp "${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh" "$TOR_ENTRYPOINT_SCRIPT"
+      chmod +x "$TOR_ENTRYPOINT_SCRIPT"
+    fi
     compose_files+=( "--file" "${tor_compose_file}" )
   fi
 
