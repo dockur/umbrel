@@ -35,8 +35,8 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 		},
 	}
 	if (command === 'up') {
-                await fse.copy(`${currentDirname}/tor-proxy-torrc`, `/data/tor/tor-proxy-torrc`)
-                await fse.copy(`${currentDirname}/tor-server-torrc`, `/data/tor/tor-server-torrc`)
+                await fse.copy(`${currentDirname}/tor-proxy-torrc`, `${umbreld.dataDirectory}/tor/tor-proxy-torrc`)
+                await fse.copy(`${currentDirname}/tor-server-torrc`, `${umbreld.dataDirectory}/tor/tor-server-torrc`)
 		await $(
 			options as any,
 		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
