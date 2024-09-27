@@ -157,7 +157,7 @@ source_app() {
 
   # Tor specific exports
   export TOR_DATA_DIR="${UMBREL_ROOT}/tor/data"
-  export TOR_ENTRYPOINT_SCRIPT="${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh"
+  export TOR_ENTRYPOINT_SCRIPT="/data/tor/tor-entrypoint.sh"
   export TOR_HS_APP_DIR="/data/app-${app}"
   export TOR_HS_PORTS="80:${APP_PROXY_HOSTNAME}:${APP_PROXY_PORT}"
 
@@ -273,6 +273,9 @@ compose() {
   # If remote Tor access is enabled
   # Then include a compose file for Tor
   if [[ "${REMOTE_TOR_ACCESS}" == "true" ]]; then
+    mkdir -p /data/tor
+    cp "${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh" "$TOR_ENTRYPOINT_SCRIPT"
+    chmod +x "$TOR_ENTRYPOINT_SCRIPT"
     compose_files+=( "--file" "${tor_compose_file}" )
   fi
 
