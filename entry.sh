@@ -17,42 +17,28 @@ fi
 target=$(hostname)
 
 if ! docker inspect "$target" &>/dev/null; then
-
-  containers=$(sudo docker ps | awk '{if(NR>1) print $NF}')
-
-  for container in $containers
-  do
-    resp=$(docker inspect "$container")
-    if [[ "${resp,,}" == *"\"/data:/data\""* ]] || [[ "${resp,,}" == *"\"/data:/data:"* ]]; then
-      target="$container"
-      break
-    fi
-  done
-
-fi
-
-if ! docker inspect "$target" &>/dev/null; then
-  echo "ERROR: Failed to find container!" && exit 16
+  echo "ERROR: Failed to find a container with name '$target'!" && exit 16
 fi
 
 resp=$(docker inspect "$target")
+network=$(echo "$resp" | jq -r '.[0].NetworkSettings.Networks["umbrel_main_network"]')
 
-if [[ "${resp,,}" != *"umbrel_main_network"* ]] ;then
+if [ -z "$network" ]; then
   if ! docker network connect umbrel_main_network "$target"; then
     echo "ERROR: Failed to connect container to network!" && exit 17
   fi
 fi
 
-if [[ "${resp,,}" != *"\"/data:/data\""* ]] && [[ "${resp,,}" != *"\"/data:/data:"* ]]; then
-  echo "ERROR: You did not bind the /data:/data folder!" && exit 18
+mount=$(echo "$resp" | jq -r '.[0].Mounts[] | select(.Destination == "/data").Source')
+
+if [ -z "$mount" ]; then
+  echo "ERROR: You did not bind the /data folder!" && exit 18
 fi
 
 # Create directories
-mkdir -p /images
-mkdir -p /data/tor/
-mkdir -p /data/umbrel-os/home
-mkdir -p /data/umbrel-os/var/log
+mkdir -p "/images"
+mkdir -p "$mount/tor"
 
 trap "pkill -SIGINT -f umbreld; while pgrep umbreld >/dev/null; do sleep 1; done" SIGINT SIGTERM
 
-umbreld --data-directory /data & wait $!
+umbreld --data-directory "$mount" & wait $!
