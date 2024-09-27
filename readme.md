@@ -12,7 +12,7 @@
 
 </div></h1>
 
-Docker container of [UmbrelOS](https://umbrel.com/), making it possible to run it everywhere instead of needing a dedicated device.
+Docker container of [UmbrelOS](https://umbrel.com/), making it possible to run it on every system instead of needing a dedicated device.
 
 ## Features ✨
 
@@ -38,7 +38,7 @@ services:
 Via Docker CLI:
 
 ```bash
-docker run -it --rm -p 80:80 -v /data:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
+docker run -it --rm -p 80:80 -v /home/example:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
 
 ## Stars 🌟
