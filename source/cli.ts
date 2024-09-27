@@ -8,6 +8,16 @@ import {cliClient} from './modules/cli-client.js'
 import Umbreld, {type UmbreldOptions} from './index.js'
 import {setSystemStatus} from './modules/server/trpc/routes/system.js'
 
+// Quick trpc client for testing
+if (process.argv.includes('client')) {
+	const clientIndex = process.argv.indexOf('client')
+	const query = process.argv[clientIndex + 1]
+	const args = process.argv.slice(clientIndex + 2)
+
+	await cliClient({query, args})
+	process.exit(0)
+}
+
 const showHelp = () =>
 	console.log(`
     Usage
