@@ -38,6 +38,13 @@ fi
 # Create directories
 mkdir -p "/images"
 
+# Convert Windows paths to Linux path
+if [[ "$mount" == *":\\"* ]]; then
+  mount="${mount,,}"
+  mount="${mount//\\//}"
+  mount="/mnt/${mount/:/}"
+fi
+
 # Mirror external folder to local filesystem
 if [[ "$mount" != "/data" ]]; then
   mkdir -p "$mount"
