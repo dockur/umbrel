@@ -42,7 +42,7 @@ mkdir -p "/images"
 if [[ "$mount" == *":\\"* ]]; then
   mount="${mount,,}"
   mount="${mount//\\//}"
-  mount="/mnt/${mount/:/}"
+  mount="//${mount/:/}"
 fi
 
 # Mirror external folder to local filesystem
