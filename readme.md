@@ -27,6 +27,7 @@ services:
   umbrel:
     image: dockurr/umbrel
     container_name: umbrel
+    hostname: umbrel
     ports:
       - 80:80
     volumes:
@@ -38,7 +39,7 @@ services:
 Via Docker CLI:
 
 ```bash
-docker run -it --rm -p 80:80 -v /home/example:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
+docker run -it --rm -p 80:80 -h umbrel -v /home/example:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
 
 ## Stars 🌟
