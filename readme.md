@@ -41,6 +41,8 @@ Via Docker CLI:
 docker run -it --rm -p 80:80 -v /home/example:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
 
+## Screenshot 📸
+
 <div align="center">
 <a href="https://github.com/dockur/umbrel"><img src="https://raw.githubusercontent.com/dockur/umbrel/master/.github/screen.png" title="Screenshot" style="max-width:100%;" width="256" /></a>
 </div>
