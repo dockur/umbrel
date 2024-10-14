@@ -12,7 +12,7 @@
 
 </div></h1>
 
-Docker container of [Umbrel](https://umbrel.com/umbrelos) (the ultimate OS for selfhosting), making it possible to run it on any system instead of needing a dedicated device.
+Docker container of [Umbrel](https://umbrel.com/umbrelos) (the ultimate OS for self-hosting), making it possible to run it on any system instead of needing a dedicated device.
 
 ## Features ✨
 
