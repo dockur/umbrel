@@ -41,6 +41,19 @@ Via Docker CLI:
 docker run -it --rm -p 80:80 -v /home/example:/data -v /var/run/docker.sock:/var/run/docker.sock --stop-timeout 60 dockurr/umbrel
 ```
 
+## FAQ 💬
+
+### How do I change the storage location?
+
+  To change the storage location, include the following bind mount in your compose file:
+
+  ```yaml
+  volumes:
+    - /home/example:/data
+  ```
+
+  Replace the example path `/home/example` with the desired storage folder.
+
 ## Stars 🌟
 [![Stars](https://starchart.cc/dockur/umbrel.svg?variant=adaptive)](https://starchart.cc/dockur/umbrel)
 
