@@ -31,7 +31,7 @@ fi
 
 mount=$(echo "$resp" | jq -r '.[0].Mounts[] | select(.Destination == "/data").Source')
 
-if [ -z "$mount" ] || [[ "$mount" == "null" ]] || [ ! -d /data ]; then
+if [ -z "$mount" ] || [[ "$mount" == "null" ]] || [ ! -d "/data" ]; then
   echo "ERROR: You did not bind the /data folder!" && exit 18
 fi
 
@@ -43,6 +43,10 @@ if [[ "$mount" == *":\\"* ]]; then
   mount="${mount,,}"
   mount="${mount//\\//}"
   mount="//${mount/:/}"
+fi
+
+if [[ "$mount" != "/"* ]]; then
+  echo "ERROR: Please bind the /data folder to an absolute path!" && exit 19
 fi
 
 # Mirror external folder to local filesystem
