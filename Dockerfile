@@ -9,7 +9,7 @@ COPY source /packages/umbreld/source
 # ui build stage
 #########################################################################
 
-FROM --platform=$BUILDPLATFORM node:18 AS ui-build
+FROM --platform=$BUILDPLATFORM node:22 AS ui-build
 
 # Install pnpm
 RUN npm install -g pnpm@8
@@ -31,7 +31,7 @@ RUN pnpm run build
 # backend build stage
 #########################################################################
 
-FROM node:18 AS be-build
+FROM node:22 AS be-build
 
 COPY --from=base packages/umbreld /tmp/umbreld
 COPY --from=ui-build /app/dist /tmp/umbreld/ui
