@@ -61,7 +61,7 @@ export default class Apps {
 		if (!(await fse.exists(umbrelSeedFile))) {
 			this.logger.log('Creating Umbrel seed')
 			await fse.ensureFile(umbrelSeedFile)
-			await fse.writeFile(umbrelSeedFile, randomToken(256))
+			await fse.writeFile(umbrelSeedFile, await randomToken(256))
 		}
 
 		// Setup bin dir
@@ -261,12 +261,12 @@ export default class Apps {
 
 		const app = this.getApp(appId)
 
-		await app.uninstall()
-
-		// Remove app instance
-		this.instances = this.instances.filter((app) => app.id !== appId)
-
-		return true
+		const uninstalled = await app.uninstall()
+		if (uninstalled) {
+			// Remove app instance
+			this.instances = this.instances.filter((app) => app.id !== appId)
+		}
+		return uninstalled
 	}
 
 	async restart(appId: string) {
