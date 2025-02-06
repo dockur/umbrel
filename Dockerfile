@@ -10,7 +10,7 @@ COPY source /packages/umbreld/source
 # ui build stage
 #########################################################################
 
-FROM --platform=$BUILDPLATFORM node:18 AS ui-build
+FROM --platform=$BUILDPLATFORM node:22 AS ui-build
 
 # Install pnpm
 RUN npm install -g pnpm@8
@@ -32,16 +32,16 @@ RUN pnpm run build
 # backend build stage
 #########################################################################
 
-FROM node:18 AS be-build
+FROM node:22 AS be-build
 
-COPY --from=base packages/umbreld /tmp/umbreld
-COPY --from=ui-build /app/dist /tmp/umbreld/ui
-WORKDIR /tmp/umbreld
-RUN chmod +x /tmp/umbreld/source/modules/apps/legacy-compat/app-script
+COPY --from=base packages/umbreld /opt/umbreld
+COPY --from=ui-build /app/dist /opt/umbreld/ui
+WORKDIR /opt/umbreld
+RUN chmod +x /opt/umbreld/source/modules/apps/legacy-compat/app-script
 
 # Install the dependencies
 RUN rm -rf node_modules || true
-RUN npm install
+RUN npm clean-install && npm link
 
 # Build the app
 RUN npm run build -- --native
@@ -62,8 +62,8 @@ ARG DEBCONF_NONINTERACTIVE_SEEN="true"
 
 RUN set -eu \
   && apt-get update -y \
-  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates dmidecode \
-  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns whois procps tini \
+  && apt-get --no-install-recommends -y install sudo nano vim less man iproute2 iputils-ping curl wget ca-certificates samba wsdd2 p7zip-full dmidecode \
+  && apt-get --no-install-recommends -y install python3 fswatch jq rsync curl git gettext-base gnupg libnss-mdns whois procps tini imagemagick ffmpeg \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
   && apt-get update -y \
@@ -73,13 +73,14 @@ RUN set -eu \
   && curl -sLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH} \
   && chmod +x /usr/local/bin/yq \
   && echo "$VERSION_ARG" > /run/version \
-  && adduser --gecos "" --disabled-password umbrel \
+  && addgroup --gid 1000 umbrel \
+  && adduser --uid 1000 --gid 1000 --gecos "" --disabled-password umbrel \
   && echo "umbrel:umbrel" | chpasswd \
-  && usermod -aG sudo umbrel
+  && usermod -aG sudo,sambashare umbrel
 
 # Install umbreld
 COPY --chmod=755 ./entry.sh /run/
-COPY --from=be-build --chmod=755 /tmp/umbreld/build/umbreld /usr/local/bin/umbreld
+COPY --from=be-build --chmod=755 /opt/umbreld/build/umbreld /usr/local/bin/umbreld
 
 VOLUME /data
 EXPOSE 80 443
