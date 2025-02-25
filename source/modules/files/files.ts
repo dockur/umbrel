@@ -208,7 +208,7 @@ export default class Files {
 				if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
 					// When current exists, make sure it's a directory
 					const stats = await fse.lstat(current).catch(() => null)
-					if (!stats?.isDirectory()) {
+					if (!(stats?.isDirectory() || stats?.isSymbolicLink())) {
 						throw new Error('ENOTDIR: Cannot ensure directory at non-directory')
 					}
 				} else {
