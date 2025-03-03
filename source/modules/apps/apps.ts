@@ -113,7 +113,7 @@ export default class Apps {
 
 		try {
 			// Create tor data directory
-			await $`mkdir -p ${this.#umbreld.dataDirectory}/tor/data`
+			await $`mkdir -p ${this.#umbreld.dataDirectory}/tor`
 		} catch (error) {
 			this.logger.error(`Failed to create Tor data directory: ${(error as Error).message}`)
 		}
