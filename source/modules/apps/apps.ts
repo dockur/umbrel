@@ -111,13 +111,6 @@ export default class Apps {
 			this.logger.error(`Failed to pre-load local Docker images: ${(error as Error).message}`)
 		}
 
-		try {
-			// Create tor data directory
-			await $`mkdir -p ${this.#umbreld.dataDirectory}/tor`
-		} catch (error) {
-			this.logger.error(`Failed to create Tor data directory: ${(error as Error).message}`)
-		}
-
  		// Start app environment
 		try {
 			try {
