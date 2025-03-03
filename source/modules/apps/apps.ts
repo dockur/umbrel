@@ -113,13 +113,15 @@ export default class Apps {
 
 		try {
 			// Create tor data directory
-			await $`mkdir -p ${this.#umbreld.dataDirectory}/tor`
+			await $`mkdir -p ${this.#umbreld.dataDirectory}/tor/data`
 		} catch (error) {
 			this.logger.error(`Failed to create Tor data directory: ${(error as Error).message}`)
 		}
 
 		try {
 			// Set permissions for tor data directory
+			await $`sudo chmod 700 ${this.#umbreld.dataDirectory}/tor/data`
+			await $`sudo chmod -R 700 ${this.#umbreld.dataDirectory}/tor/data/*`
 			await $`sudo chown -R 1000:1000 ${this.#umbreld.dataDirectory}/tor`
 		} catch (error) {
 			this.logger.error(`Failed to set permissions for Tor data directory: ${(error as Error).message}`)
