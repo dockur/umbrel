@@ -70,10 +70,6 @@ fi
 
 # Create directories
 mkdir -p "/images"
-mkdir -p "$mount/tor/data"
-chmod 700 "$mount/tor/data"
-chmod -R 700 "$mount/tor/data/*"
-chown -R 1000:1000 "$mount/tor"
 
 trap - ERR
 cd /opt/umbreld
