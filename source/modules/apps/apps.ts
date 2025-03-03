@@ -118,15 +118,6 @@ export default class Apps {
 			this.logger.error(`Failed to create Tor data directory: ${(error as Error).message}`)
 		}
 
-		try {
-			// Set permissions for tor data directory
-			await $`sudo chmod 700 ${this.#umbreld.dataDirectory}/tor/data`
-			await $`sudo chmod -R 700 ${this.#umbreld.dataDirectory}/tor/data/*`
-			await $`sudo chown -R 1000:1000 ${this.#umbreld.dataDirectory}/tor`
-		} catch (error) {
-			this.logger.error(`Failed to set permissions for Tor data directory: ${(error as Error).message}`)
-		}
-
  		// Start app environment
 		try {
 			try {
@@ -145,6 +136,13 @@ export default class Apps {
 		} catch (error) {
 			// Log the error but continue to try to bring apps up to make it a less bad failure
 			this.logger.error(`Failed to start app environment: ${(error as Error).message}`)
+		}
+
+		try {
+			// Set permissions for tor data directory
+			await $`sudo chown -R 1000:1000 ${this.#umbreld.dataDirectory}/tor`
+		} catch (error) {
+			this.logger.error(`Failed to set permissions for Tor data directory: ${(error as Error).message}`)
 		}
 
 		// Start apps
