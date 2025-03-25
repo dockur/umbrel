@@ -45,7 +45,7 @@ docker run -it --rm --name umbrel --pid=host -p 80:80 -v ${PWD:-.}/umbrel:/data 
 
 ##### Via Github Codespaces:
 
-[`Click here to launch this container in the cloud!`](https://github.com/codespaces/new?skip_quickstart=true&machine=basicLinux32gb&repo=862032083&ref=master&devcontainer_path=.devcontainer.json)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?repo=862032083&machine=basicLinux32gb)
 
 ## Screenshot 📸
 
