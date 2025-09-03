@@ -13,7 +13,7 @@ jobs:
         env:
           SHELLCHECK_OPTS: -x --source-path=src -e SC3333
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.2.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008,DL3059,DL4001,DL4006,DL3016
