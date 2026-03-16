@@ -6,7 +6,7 @@ import camelcaseKeys from 'camelcase-keys'
 
 import {cliClient} from './modules/cli-client.js'
 import Umbreld, {type UmbreldOptions} from './index.js'
-import {setSystemStatus} from './modules/server/trpc/routes/system.js'
+import {setSystemStatus} from './modules/system/routes.js'
 
 // Quick trpc client for testing
 if (process.argv.includes('client')) {
@@ -60,7 +60,7 @@ async function cleanShutdown(signal: string) {
 
 	umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
 	await umbreld.stop()
-	process.exit(130)
+	process.exit(0)
 }
 process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
 process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))

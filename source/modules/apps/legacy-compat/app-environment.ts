@@ -7,12 +7,16 @@ import fse from 'fs-extra'
 import type Umbreld from '../../../index.js'
 
 export default async function appEnvironment(umbreld: Umbreld, command: string) {
+	let inheritStdio = true
+	// Prevent breaking test output
+	if (process.env.TEST === 'true') inheritStdio = false
+
 	const currentFilename = fileURLToPath(import.meta.url)
 	const currentDirname = dirname(currentFilename)
 	const composePath = join(currentDirname, 'docker-compose.yml')
 	const torEnabled = await umbreld.store.get('torEnabled')
 	const options = {
-		stdio: 'inherit',
+		stdio: inheritStdio ? 'inherit' : 'pipe',
 		cwd: umbreld.dataDirectory,
 		env: {
 			UMBREL_DATA_DIR: umbreld.dataDirectory,
@@ -35,6 +39,7 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 		},
 	}
 	if (command === 'up') {
+		// Docker: Copy torrc files to data directory so they're accessible to tor containers
                 await fse.copy(`${currentDirname}/tor-proxy-torrc`, `${umbreld.dataDirectory}/tor/tor-proxy-torrc`)
                 await fse.copy(`${currentDirname}/tor-server-torrc`, `${umbreld.dataDirectory}/tor/tor-server-torrc`)
 		await $(

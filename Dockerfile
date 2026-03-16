@@ -6,7 +6,7 @@ ARG DEBIAN_VERSION=bookworm
 
 FROM --platform=$BUILDPLATFORM scratch AS base
 
-ARG VERSION_ARG="0.0"
+ARG VERSION_ARG="1.5.0"
 ADD https://github.com/getumbrel/umbrel.git#${VERSION_ARG} /
 
 # Apply custom patches
@@ -22,10 +22,11 @@ FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-${DEBIAN_VERSION} AS ui-buil
 RUN npm install -g pnpm@8
 
 # Set the working directory
-WORKDIR /app
+WORKDIR /packages/ui
 
-# Copy the package.json and package-lock.json
+# Copy ui and umbreld source (ui imports shared types from umbreld)
 COPY --from=base packages/ui/ .
+COPY --from=base packages/umbreld/source /packages/umbreld/source
 
 # Install the dependencies
 RUN rm -rf node_modules || true
@@ -41,7 +42,7 @@ RUN pnpm run build
 FROM node:${NODE_VERSION}-${DEBIAN_VERSION} AS be-build
 
 COPY --from=base packages/umbreld /opt/umbreld
-COPY --from=ui-build /app/dist /opt/umbreld/ui
+COPY --from=ui-build /packages/ui/dist /opt/umbreld/ui
 WORKDIR /opt/umbreld
 RUN chmod +x /opt/umbreld/source/modules/apps/legacy-compat/app-script
 
@@ -63,7 +64,7 @@ ARG TARGETARCH
 ARG YQ_VERSION
 ARG NODE_VERSION
 
-ARG VERSION_ARG="0.0"
+ARG VERSION_ARG="1.5.0"
 ARG DEBCONF_NOWARNINGS="yes"
 ARG DEBIAN_FRONTEND="noninteractive"
 ARG DEBCONF_NONINTERACTIVE_SEEN="true"

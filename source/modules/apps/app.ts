@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import nodePath from 'node:path'
 
 import fse from 'fs-extra'
 import yaml from 'js-yaml'
@@ -51,11 +52,6 @@ type AppState =
 	| 'uninstalling'
 	| 'updating'
 	| 'ready'
-// TODO: Change ready to running.
-// Also note that we don't currently handle failing events to update the app state into a failed state.
-// That should be ok for now since apps rarely fail, but there will be the potential for state bugs here
-// where the app instance state gets out of sync with the actual state of the app.
-// We can handle this much more robustly in the future.
 
 export default class App {
 	#umbreld: Umbreld
@@ -86,7 +82,7 @@ export default class App {
 		return readYaml(`${this.dataDirectory}/docker-compose.yml`) as Promise<Compose>
 	}
 
-        patchCompose() {
+	patchCompose() {
 		return patchYaml(`${this.dataDirectory}/docker-compose.yml`)
 	}
 
@@ -94,7 +90,7 @@ export default class App {
 		try {
 			return await fse.readFile(`${this.#umbreld.dataDirectory}/tor/data/app-${this.id}/hostname`, 'utf-8')
 		} catch (error) {
-			this.logger.error(`Failed to read hidden service for app ${this.id}: ${(error as Error).message}`)
+			this.logger.error(`Failed to read hidden service for app ${this.id}`, error)
 			return ''
 		}
 	}
@@ -112,28 +108,35 @@ export default class App {
 	}
 
 	async patchComposeFile() {
+		const manifest = await this.readManifest()
+		const appRequestsGpuAccess = manifest.permissions?.includes('GPU')
+		const DRI_DEVICE_PATH = '/dev/dri'
+		const deviceHasGpu = await fse.exists(DRI_DEVICE_PATH).catch(() => false)
+
 		const compose = await this.readCompose()
 		for (const serviceName of Object.keys(compose.services!)) {
 			// Temporary patch to fix contianer names for modern docker-compose installs.
-			// The contianer name scheme used to be <project-name>_<service-name>_1 but
-			// recent versions of docker-compose use <project-name>-<service-name>-1
-			// swapping underscores for dashes. This breaks Umbrel in places where the
-			// containers are referenced via name and it also breaks referring to other
-			// containers via DNS since the hostnames are derived with the same method.
-			// We manually force all container names to the old scheme to maintain compatibility.
 			if (!compose.services![serviceName].container_name) {
 				compose.services![serviceName].container_name = `${this.id}_${serviceName}_1`
 			}
 
-			// Migrate downloads volume from old `${UMBREL_ROOT}/data/storage/downloads` path to new
-			// `${UMBREL_ROOT}/home/Downloads` path.
-			// We need to do this here to handle any future app updates
+			// Migrate downloads volume from old path to new path.
 			compose.services![serviceName].volumes = compose.services![serviceName].volumes?.map((volume) => {
-				return (volume as string)?.replace('/data/storage/downloads', `/home/Downloads`)
+				return (volume as string)
+					?.replace('/data/storage/downloads', `/home/Downloads`)
+					?.replace('/data/storage', `/home`)
 			})
+
+			// Pass through host DRI device to all app containers if the app requests it
+			const shouldEnableGpuPassthrough = appRequestsGpuAccess && deviceHasGpu
+			if (shouldEnableGpuPassthrough) {
+				compose.services![serviceName].devices = compose.services![serviceName].devices || []
+				compose.services![serviceName].devices.push(DRI_DEVICE_PATH)
+			}
 		}
 
 		await this.writeCompose(compose)
+		// Docker-specific: patch Lightning REST port mapping
 		await this.patchCompose()
 	}
 
@@ -163,6 +166,7 @@ export default class App {
 			onFailedAttempt: (error) => {
 				this.logger.error(
 					`Attempt ${error.attemptNumber} installing app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+					error,
 				)
 			},
 			retries: 2,
@@ -176,9 +180,6 @@ export default class App {
 	async update() {
 		this.state = 'updating'
 		this.stateProgress = 1
-
-		// TODO: Pull images here before the install script and calculate live progress for
-		// this.stateProgress so button animations work
 
 		this.logger.log(`Updating app ${this.id}`)
 
@@ -194,8 +195,7 @@ export default class App {
 		await this.pull()
 		await appScript(this.#umbreld, 'post-patch-update', this.id)
 
-		// Delete the old images if we can. Silently fail on error cos docker
-		// will return an error even if only one image is still needed.
+		// Delete the old images if we can.
 		try {
 			await $({stdio: 'inherit'})`docker rmi ${oldImages}`
 		} catch {}
@@ -203,39 +203,50 @@ export default class App {
 		this.state = 'ready'
 		this.stateProgress = 0
 
+		// Enable auto-start on boot
+		await this.setAutoStart(true)
+
 		return true
 	}
 
 	async start() {
 		this.logger.log(`Starting app ${this.id}`)
 		this.state = 'starting'
-		// We re-run the patch here to fix an edge case where 0.5.x imported apps
-		// wont run because they haven't been patched.
 		await this.patchComposeFile()
 		await pRetry(() => appScript(this.#umbreld, 'start', this.id), {
 			onFailedAttempt: (error) => {
 				this.logger.error(
 					`Attempt ${error.attemptNumber} starting app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+					error,
 				)
 			},
 			retries: 2,
 		})
 		this.state = 'ready'
 
+		// Enable auto-start on boot
+		await this.setAutoStart(true)
+
 		return true
 	}
 
-	async stop() {
+	async stop({persistState = false}: {persistState?: boolean} = {}) {
 		this.state = 'stopping'
 		await pRetry(() => appScript(this.#umbreld, 'stop', this.id), {
 			onFailedAttempt: (error) => {
 				this.logger.error(
 					`Attempt ${error.attemptNumber} stopping app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+					error,
 				)
 			},
 			retries: 2,
 		})
 		this.state = 'stopped'
+
+		// Disable auto-start on boot
+		if (persistState) {
+			await this.setAutoStart(false)
+		}
 
 		return true
 	}
@@ -246,6 +257,9 @@ export default class App {
 		await appScript(this.#umbreld, 'start', this.id)
 		this.state = 'ready'
 
+		// Enable auto-start on boot
+		await this.setAutoStart(true)
+
 		return true
 	}
 
@@ -255,6 +269,7 @@ export default class App {
 			onFailedAttempt: (error) => {
 				this.logger.error(
 					`Attempt ${error.attemptNumber} stopping app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+					error,
 				)
 			},
 			retries: 2,
@@ -287,31 +302,24 @@ export default class App {
 		containers.push(`${this.id}_app_proxy_1`)
 		containers.push(`${this.id}_tor_server_1`)
 		try {
-			// If we fail to get the PIDs of one container, skip it and continue for
-			// the other containers. We'll expect to get it on some misses for the app
-			// proxy and tor server containers.
 			const cmd = containers.map((container) => `docker top ${container} -o pid 2>/dev/null || true`).join('\n')
 			const {stdout} = await $({shell: true})`${cmd}`
 			return stdout
-				.split('\n') // Split on newline
-				.map((line) => line.trim()) // Trim whitespace
-				.filter((line) => /^([1-9][0-9]*|0)$/.test(line)) // Keep only integers
-				.map((line) => parseInt(line, 10)) // And convert
+				.split('\n')
+				.map((line) => line.trim())
+				.filter((line) => /^([1-9][0-9]*|0)$/.test(line))
+				.map((line) => parseInt(line, 10))
 		} catch (error) {
-			this.logger.error(`Failed to get pids for app ${this.id}: ${(error as Error).message}`)
+			this.logger.error(`Failed to get pids for app ${this.id}`, error)
 			return []
 		}
 	}
 
 	async getDiskUsage() {
 		try {
-			// Disk usage calculations can fail if the app is rapidly moving files around
-			// since files in directories will be listed and then iterated over to have
-			// their size summed up. If a file is moved between these two operations it
-			// will fail. It happens rarely so simply retrying will catch most cases.
 			return await pRetry(() => getDirectorySize(this.dataDirectory), {retries: 2})
 		} catch (error) {
-			this.logger.error(`Failed to get disk usage for app ${this.id}: ${(error as Error).message}`)
+			this.logger.error(`Failed to get disk usage for app ${this.id}`, error)
 			return 0
 		}
 	}
@@ -323,8 +331,6 @@ export default class App {
 	}
 
 	async getContainerIp(service: string) {
-		// Retrieve the container name from the compose file
-		// This works because we have a temporary patch to force all container names to the old Compose scheme to maintain compatibility between Compose v1 and v2
 		const compose = await this.readCompose()
 		const containerName = compose.services![service].container_name
 
@@ -334,6 +340,31 @@ export default class App {
 			await $`docker inspect -f {{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}} ${containerName}`
 
 		return containerIp
+	}
+
+	// Returns a validated list of paths that should be ignored when backing up the app
+	async getBackupIgnoredFilePaths() {
+		const manifest = await this.readManifest()
+		if (!manifest.backupIgnore) return []
+
+		const backupIgnore = []
+		for (let path of manifest.backupIgnore) {
+			if (!/^[-a-zA-Z0-9._\/*]+$/.test(path)) {
+				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
+				continue
+			}
+
+			path = nodePath.join(this.dataDirectory, path)
+
+			if (!path.startsWith(this.dataDirectory)) {
+				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
+				continue
+			}
+
+			backupIgnore.push(path)
+		}
+
+		return backupIgnore
 	}
 
 	// Returns a specific widget's info from an app's manifest
@@ -349,7 +380,6 @@ export default class App {
 
 	// Returns a specific widget's data
 	async getWidgetData(widgetId: string) {
-		// Get widget info from the app's manifest
 		const widgetMetadata = await this.getWidgetMetadata(widgetId)
 
 		const url = new URL(`http://${widgetMetadata.endpoint}`)
@@ -398,9 +428,29 @@ export default class App {
 		const success = await this.store.set('dependencies', filledSelectedDependencies)
 		if (success) {
 			this.restart().catch((error) => {
-				this.logger.error(`Failed to restart '${this.id}': ${error.message}`)
+				this.logger.error(`Failed to restart '${this.id}'`, error)
 			})
 		}
 		return success
+	}
+
+	// Check if app is ignored from backups
+	async isBackupIgnored() {
+		return (await this.store.get('backupIgnore')) || false
+	}
+
+	// Set if app is ignored from backups
+	async setBackupIgnored(backupIgnore: boolean) {
+		return this.store.set('backupIgnore', backupIgnore)
+	}
+
+	// Set if app should auto start on boot
+	async setAutoStart(autoStart: boolean) {
+		return this.store.set('autoStart', autoStart)
+	}
+
+	// Get if app should auto start on boot
+	async shouldAutoStart() {
+		return (await this.store.get('autoStart')) ?? true
 	}
 }
