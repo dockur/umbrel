@@ -1,8 +1,8 @@
 import {$} from 'execa'
 import { setTimeout } from 'node:timers/promises';
-import type {ProgressStatus} from './apps/schema.js'
+import type {ProgressStatus} from '../apps/schema.js'
 import {detectDevice, isUmbrelOS} from './system.js'
-import Umbreld from '../index.js'
+import Umbreld from '../../index.js'
 
 type UpdateStatus = ProgressStatus
 

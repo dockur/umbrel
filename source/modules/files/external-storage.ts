@@ -1,65 +1,45 @@
 import nodePath from 'node:path'
 
-import {$} from 'execa'
 import fse from 'fs-extra'
+import {$} from 'execa'
 import PQueue from 'p-queue'
 
 import type Umbreld from '../../index.js'
-import isUmbrelHome from '../is-umbrel-home.js'
 
-type LsblkDevice = {
+type BlockDevice = {
+	id: string
 	name: string
-	kname: string
-	label?: string | null
-	type?: string
-	mountpoints?: string[] | null
-	tran?: string | null
-	model?: string | null
-	size?: number | null
-	children?: LsblkDevice[]
-	parttypename?: string
-	serial?: string
-}
-
-type Disk = {
-	id: string
-	label: string
+	transport: 'unknown' | 'usb' | 'nvme'
 	size: number
+	isMounted: boolean
+	isFormatting: boolean
+	partitions: {
+		id: string
+		type: string
+		size: number
+		mountpoints: string[]
+		label: string
+	}[]
 }
 
-type Partition = {
-	id: string
-	diskId: string
-	mountpoints: string[]
-	label: string
-	size: number
+// Get block devices — stub for Docker
+export async function getBlockDevices(): Promise<BlockDevice[]> {
+	return []
 }
 
-type Mount = {
-	diskId: string
-	partitionId: string
-	mountpoint: string
-	label: string
-	size: number
-}
-
-const mountQueue = new PQueue({concurrency: 1})
-
-async function isSupported() {
-	return false
-}
-
-class ExternalStorage {
+export default class ExternalStorage {
 	#umbreld: Umbreld
 	logger: Umbreld['logger']
-	disks: Map<string, Disk> = new Map()
-	mounts: Map<string, Mount> = new Map()
-	running = false
+	formatJobs: Set<string> = new Set()
 
 	constructor(umbreld: Umbreld) {
 		this.#umbreld = umbreld
 		const {name} = this.constructor
-		this.logger = umbreld.logger.createChildLogger(name.toLocaleLowerCase())
+		this.logger = umbreld.logger.createChildLogger(`files:${name.toLocaleLowerCase()}`)
+	}
+
+	async supported() {
+		return false
 	}
 
 	async start() {
@@ -70,53 +50,31 @@ class ExternalStorage {
 		return
 	}
 
-	get() {
-		return null
+	async unmountExternalDevice(deviceId: string, {remove = true} = {}) {
+		throw new Error('External storage is not supported in Docker')
 	}
 
-	async updateMounts() {
-    this.logger.error(`Failed to update mounts`)
+	async formatExternalDevice({
+		deviceId,
+		filesystem,
+		label,
+	}: {
+		deviceId: string
+		filesystem: 'ext4' | 'exfat'
+		label: string
+	}) {
+		throw new Error('External storage is not supported in Docker')
+	}
+
+	async getExternalDevicesWithVirtualMountPoints(): Promise<BlockDevice[]> {
+		return []
+	}
+
+	async getMountedExternalDevices(): Promise<BlockDevice[]> {
+		return []
+	}
+
+	async isExternalDeviceConnectedOnUnsupportedDevice() {
 		return false
 	}
-
-	async eject(diskId: string) {
-		this.logger.error(`Failed to eject disk '${disk.id}'`)
-		return false
-	}
-
-	#onUdisksChange = () => {
-		this.updateMounts().catch((error) => this.logger.error(`Failed to update mounts: ${error.message}`))
-	}
-
-	async isExternalDriveConnectedOnNonUmbrelHome() {
-		
-		return false
-
-  }
-}
-
-export default ExternalStorage
-
-async function getDisksAndPartitions() {
-
-	const disks: Disk[] = []
-	const partitions: Partition[] = []
-
-	return {disks, partitions}
-}
-
-async function mountExists(mountpoint: string) {
-	return false
-}
-
-async function mountPartition(id: string, mountpoint: string) {
-	return false
-}
-
-async function unmountPartition(mountpoint: string) {
-	return false
-}
-
-async function discardDisk(diskId: string) {
-	return false
 }

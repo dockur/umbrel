@@ -3,13 +3,13 @@ import {isIPv4} from 'node:net'
 import {setTimeout} from 'node:timers/promises'
 
 import systemInformation from 'systeminformation'
-import {$} from 'execa'
+import {$, type ExecaError} from 'execa'
 import fse from 'fs-extra'
 import PQueue from 'p-queue'
 
-import type Umbreld from '../index.js'
+import type Umbreld from '../../index.js'
 
-import getDirectorySize from './utilities/get-directory-size.js'
+import getDirectorySize from '../utilities/get-directory-size.js'
 
 export async function getCpuTemperature(): Promise<{
 	warning: 'normal' | 'warm' | 'hot'
@@ -42,30 +42,20 @@ type DiskUsage = {
 	used: number
 }
 
-export async function getSystemDiskUsage(umbreld: Umbreld): Promise<{size: number; totalUsed: number}> {
-	if (typeof umbreld.dataDirectory !== 'string' || umbreld.dataDirectory === '') {
-		throw new Error('umbreldDataDir must be a non-empty string')
-	}
+export async function getDiskUsageByPath(path: string): Promise<{size: number; totalUsed: number; available: number}> {
+	if (typeof path !== 'string' || path === '') throw new Error('path must be a non-empty string')
 
-	// to calculate the disk usage of each app
-	const fileSystemSize = await systemInformation.fsSize()
+	// Piggy back on df and get the result in bytes
+	const df = await $`df --output=size,used,avail --block-size=1 ${path}`
+	const [size, totalUsed, available] = df.stdout.split('\n').slice(-1)[0].split(' ').map(Number)
 
-	// Get the disk usage information for the file system containing the Umbreld data dir.
-	// Sort by mount length to get the most specific mount point
-	const df = await $`df -h ${umbreld.dataDirectory}`
-	const partition = df.stdout.split('\n').slice(-1)[0].split(' ')[0]
-	const dataDirectoryFilesystem = fileSystemSize.find((filesystem) => filesystem.fs === partition)
+	return {size, totalUsed, available}
+}
 
-	if (!dataDirectoryFilesystem) {
-		throw new Error('Could not find file system containing Umbreld data directory')
-	}
-
-	const {size, used} = dataDirectoryFilesystem
-
-	return {
-		size,
-		totalUsed: used,
-	}
+export async function getSystemDiskUsage(
+	umbreld: Umbreld,
+): Promise<{size: number; totalUsed: number; available: number}> {
+	return await getDiskUsageByPath(umbreld.dataDirectory)
 }
 
 export async function getDiskUsage(
@@ -85,10 +75,9 @@ export async function getDiskUsage(
 	const filesTotalUsage = (
 		await Promise.all(
 			[
-				umbreld.files.homeDirectory,
-				umbreld.files.trashDirectory,
-				umbreld.files.trashMetaDirectory,
-				umbreld.files.thumbnails.thumbnailsDirectory,
+				umbreld.files.getBaseDirectory('/Home'),
+				umbreld.files.getBaseDirectory('/Trash'),
+				umbreld.files.thumbnails.thumbnailDirectory,
 			].map((directory) => getDirectorySize(directory).catch(() => 0)),
 		)
 	).reduce((total, usage) => total + usage, 0)
@@ -107,6 +96,7 @@ export async function getDiskUsage(
 // Returns a list of all processes and their memory usage
 async function getProcessesMemory() {
 	// Get a snapshot of system CPU and memory usage
+	// In Docker we need to exec into the host PID namespace
 	const ps = await $`docker exec --privileged ${os.hostname()} ps -Ao pid,pss --no-header`
 
 	// Format snapshot data
@@ -172,7 +162,7 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
 					.filter((process) => appPids.includes(process.pid))
 					.reduce((total, process) => total + process.memory, 0)
 			} catch (error) {
-				umbreld.logger.error(`Error getting memory: ${(error as Error).message}`)
+				umbreld.logger.error(`Error getting memory`, error)
 			}
 			return {
 				id: app.id,
@@ -196,6 +186,7 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
 // Returns a list of all processes and their cpu usage
 async function getProcessesCpu() {
 	// Get a snapshot of system CPU and memory usage
+	// In Docker we need to exec into the host PID namespace
 	const top = await $`docker exec --privileged ${os.hostname()} top --batch-mode --iterations 1`
 
 	// Get lines
@@ -248,7 +239,7 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
 					.filter((process) => appPids.includes(process.pid))
 					.reduce((total, process) => total + process.cpu, 0)
 			} catch (error) {
-				umbreld.logger.error(`Error getting cpu: ${(error as Error).message}`)
+				umbreld.logger.error(`Error getting cpu`, error)
 			}
 			return {
 				id: app.id,
@@ -305,6 +296,7 @@ export async function detectDevice() {
 
 	if (model === 'U130120') device = 'Umbrel Home (2023)'
 	if (model === 'U130121') device = 'Umbrel Home (2024)'
+	if (model === 'U130122') device = 'Umbrel Home (2025)'
 	if (productName === 'Umbrel Home') deviceId = model
 
 	// I haven't been able to find another way to reliably detect Pi hardware. Most existing
@@ -353,6 +345,17 @@ export async function setCpuGovernor(governor: string) {
 	await fse.writeFile('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor', governor)
 }
 
+export async function setupPiCpuGovernor(umbreld: Umbreld): Promise<void> {
+	try {
+		if (await isRaspberryPi()) {
+			await setCpuGovernor('ondemand')
+			umbreld.logger.log(`Set ondemand cpu governor`)
+		}
+	} catch (error) {
+		umbreld.logger.error(`Failed to set ondemand cpu governor`, error)
+	}
+}
+
 export async function hasWifi() {
 	return false
 }
@@ -367,6 +370,10 @@ export async function deleteWifiConnections({inactiveOnly = false}: {inactiveOnl
 
 export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}) {
 	throw new Error('Not supported')
+}
+
+export async function restoreWiFi(umbreld: Umbreld): Promise<void> {
+	return
 }
 
 // Get IP addresses of the device
@@ -394,7 +401,7 @@ export function getIpAddresses(): string[] {
 		// Local loopback (127.0.0.0/8)
 		/^127\./,
 		// Docker internal network (10.21.0.0/16)
-		/^10\.21\./,		
+		/^10\.21\./,
 		// Non-routable APIPA (169.254.0.0/16), e.g. misconfigured DHCP
 		/^169\.254\./,
 	]
@@ -418,4 +425,14 @@ const syncDnsQueue = new PQueue({concurrency: 1})
 // Update DNS configuration to match user settings
 export async function syncDns() {
 	return true
+}
+
+// Wait for Pi system time to be synced for up to the number of seconds passed in.
+export async function waitForSystemTime(umbreld: Umbreld, timeout: number): Promise<void> {
+	return
+}
+
+export async function getHostname() {
+	const hostname = await fse.readFile('/etc/hostname', 'utf8')
+	return hostname.trim()
 }

@@ -26,13 +26,9 @@ export default class Apps {
 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
 	}
 
-	// This is a really brutal and heavy handed way of cleaning up old Docker state.
-	// We should only do this sparingly. It's needed if an old version of Docker
-	// didn't shutdown cleanly and then we update to a new version of Docker.
-	// The next version of Docker can have issues starting containers if the old
-	// containers/networks are still hanging around. We had this issue because sometimes
-	// 0.5.4 installs didn't clean up properly on shutdown and it causes critical errors
-	// bringing up containers in 1.0.
+	// Docker: We don't clean Docker state here because entry.sh manages the
+	// umbrel_main_network. Cleaning state would prune that external network
+	// and break app-environment compose.
 	async cleanDockerState() {
 	}
 
@@ -61,7 +57,7 @@ export default class Apps {
 		if (!(await fse.exists(umbrelSeedFile))) {
 			this.logger.log('Creating Umbrel seed')
 			await fse.ensureFile(umbrelSeedFile)
-			await fse.writeFile(umbrelSeedFile, await randomToken(256))
+			await fse.writeFile(umbrelSeedFile, randomToken(256))
 		}
 
 		// Setup bin dir
@@ -80,12 +76,25 @@ export default class Apps {
 				await fse.copyFile(source, dest)
 			}
 		} catch (error) {
-			this.logger.error(`Failed to copy bins: ${(error as Error).message}`)
+			this.logger.error(`Failed to copy bins`, error)
 		}
 
 		// Create app instances
 		const appIds = await this.#umbreld.store.get('apps')
 		this.instances = appIds.map((appId) => new App(this.#umbreld, appId))
+
+		// Don't save references to any apps that don't have a data directory on
+		// startup. This will allow apps that were excluded from backups to be
+		// reinstalled when the system is restored.
+		const appIdsMissingDataDir: string[] = []
+		for (const app of this.instances) {
+			const appDataDirectoryExists = await fse.pathExists(app.dataDirectory).catch(() => false)
+			if (!appDataDirectoryExists) {
+				this.logger.error(`App ${app.id} does not have a data directory, removing from instances`)
+				this.instances = this.instances.filter((instanceApp) => instanceApp.id !== app.id)
+				appIdsMissingDataDir.push(app.id)
+			}
+		}
 
 		// Force the app state to starting so users don't get confused.
 		// They aren't actually starting yet, we need to make sure the app env is up first.
@@ -103,12 +112,12 @@ export default class Apps {
 						this.logger.log(`Pre-loading local Docker image ${image}`)
 						await $({stdio: 'inherit'})`docker load --input /images/${image}`
 					} catch (error) {
-						this.logger.error(`Failed to pre-load local Docker image ${image}: ${(error as Error).message}`)
+						this.logger.error(`Failed to pre-load local Docker image ${image}`, error)
 					}
 				}),
 			)
 		} catch (error) {
-			this.logger.error(`Failed to pre-load local Docker images: ${(error as Error).message}`)
+			this.logger.error(`Failed to pre-load local Docker images`, error)
 		}
 
  		// Start app environment
@@ -116,40 +125,87 @@ export default class Apps {
 			try {
 				await appEnvironment(this.#umbreld, 'up')
 			} catch (error) {
-				this.logger.error(`Failed to start app environment: ${(error as Error).message}`)
+				this.logger.error(`Failed to start app environment`, error)
 			}
 			await pRetry(() => appEnvironment(this.#umbreld, 'up'), {
 				onFailedAttempt: (error) => {
 					this.logger.error(
 						`Attempt ${error.attemptNumber} starting app environmnet failed. There are ${error.retriesLeft} retries left.`,
+						error,
 					)
 				},
 				retries: 2, // This will do exponential backoff for 1s, 2s
 			})
 		} catch (error) {
 			// Log the error but continue to try to bring apps up to make it a less bad failure
-			this.logger.error(`Failed to start app environment: ${(error as Error).message}`)
+			this.logger.error(`Failed to start app environment`, error)
 		}
 
 		try {
 			// Set permissions for tor data directory
 			await $`sudo chown -R 1000:1000 ${this.#umbreld.dataDirectory}/tor`
 		} catch (error) {
-			this.logger.error(`Failed to set permissions for Tor data directory: ${(error as Error).message}`)
+			this.logger.error(`Failed to set permissions for Tor data directory`, error)
 		}
 
 		// Start apps
 		this.logger.log('Starting apps')
-		await Promise.all(
-			this.instances.map((app) =>
-				app.start().catch((error) => {
+		const appsToStart = [...this.instances]
+		const startAppsPromise = Promise.all(
+			appsToStart.map(async (app) => {
+				const shouldStart = await app.shouldAutoStart()
+				if (!shouldStart) {
+					this.logger.log(`Skipping app ${app.id} (autoStart disabled)`)
+					app.state = 'stopped'
+					return
+				}
+
+				return app.start().catch((error) => {
 					// We handle individual errors here to prevent apps start from throwing
 					// if a single app fails.
 					app.state = 'unknown'
-					this.logger.error(`Failed to start app ${app.id}: ${error.message}`)
-				}),
-			),
+					this.logger.error(`Failed to start app ${app.id}`, error)
+				})
+			}),
 		)
+
+		// If this is the first boot after a backup restore, reinstall missing apps
+		this.reinstallMissingAppsAfterRestore(appIdsMissingDataDir).catch((error) =>
+			this.logger.error('Failed to schedule app reinstalls after restore', error),
+		)
+
+		// Wait for current installed apps to finish starting
+		await startAppsPromise
+	}
+
+	private async reinstallMissingAppsAfterRestore(appIds: string[]) {
+		if (!this.#umbreld.isBackupRestoreFirstStart) return
+		if (appIds.length === 0) return
+
+		this.logger.log(`Detected ${appIds.length} app(s) missing a data directory after restore, reinstalling...`)
+		try {
+			await pRetry(
+				async () => {
+					await this.#umbreld.appStore.update()
+				},
+				{
+					retries: 3,
+					onFailedAttempt: (error) => {
+						this.logger.error(
+							`Failed to update app store before reinstalls (attempt ${error.attemptNumber}, ${error.retriesLeft} retries left).`,
+							error,
+						)
+					},
+				},
+			)
+		} catch (error) {
+			this.logger.error('Exhausted retries updating app store before reinstalls', error)
+			return
+		}
+
+		for (const appId of appIds) {
+			this.install(appId).catch((error) => this.logger.error(`Failed to reinstall app ${appId}`, error))
+		}
 	}
 
 	async stop() {
@@ -159,7 +215,7 @@ export default class Apps {
 				app.stop().catch((error) => {
 					// We handle individual errors here to prevent apps stop from throwing
 					// if a single app fails.
-					this.logger.error(`Failed to stop app ${app.id}: ${error.message}`)
+					this.logger.error(`Failed to stop app ${app.id}`, error)
 				}),
 			),
 		)
@@ -173,8 +229,6 @@ export default class Apps {
 			},
 			retries: 2,
 		})
-
-		this.logger.log('Successfully stopped all apps...')
 	}
 
 	async isInstalled(appId: string) {
@@ -231,15 +285,17 @@ export default class Apps {
 			await appEnvironment(this.#umbreld, 'up')
 			await app.install()
 		} catch (error) {
-			this.logger.error(`Failed to install app ${appId}: ${(error as Error).message}`)
+			this.logger.error(`Failed to install app ${appId}`, error)
 			this.instances = this.instances.filter((app) => app.id !== appId)
 			return false
 		}
 
 		// Save installed app
 		await this.#umbreld.store.getWriteLock(async ({get, set}) => {
-			const apps = await get('apps')
+			let apps = await get('apps')
 			apps.push(appId)
+			// Make sure we never add dupes
+			apps = [...new Set(apps)]
 			await set('apps', apps)
 		})
 
