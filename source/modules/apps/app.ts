@@ -52,6 +52,11 @@ type AppState =
 	| 'uninstalling'
 	| 'updating'
 	| 'ready'
+// TODO: Change ready to running.
+// Also note that we don't currently handle failing events to update the app state into a failed state.
+// That should be ok for now since apps rarely fail, but there will be the potential for state bugs here
+// where the app instance state gets out of sync with the actual state of the app.
+// We can handle this much more robustly in the future.
 
 export default class App {
 	#umbreld: Umbreld
@@ -82,7 +87,7 @@ export default class App {
 		return readYaml(`${this.dataDirectory}/docker-compose.yml`) as Promise<Compose>
 	}
 
-	patchCompose() {
+    patchCompose() {
 		return patchYaml(`${this.dataDirectory}/docker-compose.yml`)
 	}
 
@@ -116,11 +121,20 @@ export default class App {
 		const compose = await this.readCompose()
 		for (const serviceName of Object.keys(compose.services!)) {
 			// Temporary patch to fix contianer names for modern docker-compose installs.
+			// The contianer name scheme used to be <project-name>_<service-name>_1 but
+			// recent versions of docker-compose use <project-name>-<service-name>-1
+			// swapping underscores for dashes. This breaks Umbrel in places where the
+			// containers are referenced via name and it also breaks referring to other
+			// containers via DNS since the hostnames are derived with the same method.
+			// We manually force all container names to the old scheme to maintain compatibility.
 			if (!compose.services![serviceName].container_name) {
 				compose.services![serviceName].container_name = `${this.id}_${serviceName}_1`
 			}
 
-			// Migrate downloads volume from old path to new path.
+			// Migrate downloads volume from old `${UMBREL_ROOT}/data/storage/downloads` path to new
+			// `${UMBREL_ROOT}/home/Downloads` path. Also handle raw data directory migration from
+			// `${UMBREL_ROOT}/data/storage` to `${UMBREL_ROOT}/home`.
+			// We need to do this here to handle any future app updates.
 			compose.services![serviceName].volumes = compose.services![serviceName].volumes?.map((volume) => {
 				return (volume as string)
 					?.replace('/data/storage/downloads', `/home/Downloads`)
@@ -136,13 +150,13 @@ export default class App {
 		}
 
 		await this.writeCompose(compose)
-		// Docker-specific: patch Lightning REST port mapping
+        // Docker-specific: patch Lightning REST port mapping
 		await this.patchCompose()
 	}
 
 	async pull() {
 		const defaultImages = [
-			'getumbrel/app-proxy:1.0.0@sha256:49eb600c4667c4b948055e33171b42a509b7e0894a77e0ca40df8284c77b52fb',
+			'getumbrel/app-proxy:1.7.0@sha256:ec0de0b944a2e63d52fdd82b3760d90a35f8b442d17a8407afdee3af3e842d5a',
 			'getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a',
 		]
 		const compose = await this.readCompose()
@@ -181,6 +195,9 @@ export default class App {
 		this.state = 'updating'
 		this.stateProgress = 1
 
+		// TODO: Pull images here before the install script and calculate live progress for
+		// this.stateProgress so button animations work
+
 		this.logger.log(`Updating app ${this.id}`)
 
 		// Get a reference to the old images
@@ -195,7 +212,8 @@ export default class App {
 		await this.pull()
 		await appScript(this.#umbreld, 'post-patch-update', this.id)
 
-		// Delete the old images if we can.
+		// Delete the old images if we can. Silently fail on error cos docker
+		// will return an error even if only one image is still needed.
 		try {
 			await $({stdio: 'inherit'})`docker rmi ${oldImages}`
 		} catch {}
@@ -212,6 +230,8 @@ export default class App {
 	async start() {
 		this.logger.log(`Starting app ${this.id}`)
 		this.state = 'starting'
+		// We re-run the patch here to fix an edge case where 0.5.x imported apps
+		// wont run because they haven't been patched.
 		await this.patchComposeFile()
 		await pRetry(() => appScript(this.#umbreld, 'start', this.id), {
 			onFailedAttempt: (error) => {
@@ -296,19 +316,36 @@ export default class App {
 		return true
 	}
 
-	async getPids() {
+	async getContainerNames() {
 		const compose = await this.readCompose()
 		const containers = Object.values(compose.services!).map((service) => service.container_name) as string[]
 		containers.push(`${this.id}_app_proxy_1`)
 		containers.push(`${this.id}_tor_server_1`)
+		return containers
+	}
+
+	async getPids() {
+		const containers = await this.getContainerNames()
 		try {
-			const cmd = containers.map((container) => `docker top ${container} -o pid 2>/dev/null || true`).join('\n')
-			const {stdout} = await $({shell: true})`${cmd}`
-			return stdout
-				.split('\n')
-				.map((line) => line.trim())
-				.filter((line) => /^([1-9][0-9]*|0)$/.test(line))
-				.map((line) => parseInt(line, 10))
+			// If we fail to get the PIDs of one container, skip it and continue for
+			// the other containers. We'll expect to get it on some misses for the app
+			// proxy and tor server containers.
+			const outputs = await Promise.all(
+				containers.map(async (container) => {
+					try {
+						const {stdout} = await $`docker top ${container} -o pid`
+						return stdout
+					} catch {
+						return ''
+					}
+				}),
+			)
+			return outputs
+				.join('\n')
+				.split('\n') // Split on newline
+				.map((line) => line.trim()) // Trim whitespace
+				.filter((line) => /^([1-9][0-9]*|0)$/.test(line)) // Keep only integers
+				.map((line) => parseInt(line, 10)) // And convert
 		} catch (error) {
 			this.logger.error(`Failed to get pids for app ${this.id}`, error)
 			return []
@@ -317,6 +354,10 @@ export default class App {
 
 	async getDiskUsage() {
 		try {
+			// Disk usage calculations can fail if the app is rapidly moving files around
+			// since files in directories will be listed and then iterated over to have
+			// their size summed up. If a file is moved between these two operations it
+			// will fail. It happens rarely so simply retrying will catch most cases.
 			return await pRetry(() => getDirectorySize(this.dataDirectory), {retries: 2})
 		} catch (error) {
 			this.logger.error(`Failed to get disk usage for app ${this.id}`, error)
@@ -331,6 +372,8 @@ export default class App {
 	}
 
 	async getContainerIp(service: string) {
+		// Retrieve the container name from the compose file
+		// This works because we have a temporary patch to force all container names to the old Compose scheme to maintain compatibility between Compose v1 and v2
 		const compose = await this.readCompose()
 		const containerName = compose.services![service].container_name
 
@@ -343,24 +386,33 @@ export default class App {
 	}
 
 	// Returns a validated list of paths that should be ignored when backing up the app
+	// This allows apps to signal to umbrelOS noncritical high churn or high data files
+	// that can be ignored from backups like logs/cache/blockchain data/etc.
 	async getBackupIgnoredFilePaths() {
 		const manifest = await this.readManifest()
 		if (!manifest.backupIgnore) return []
 
+		// Sanitise paths
 		const backupIgnore = []
 		for (let path of manifest.backupIgnore) {
+			// Only allow a limited subset of chars to strip out traversals and other weird stuff we don't want to allow
+			// while supporting simple '*' globbing that Kopia understands in .kopiaignore
+			// TODO: consider adding other globbing chars like '?' (single-char wildcard) and '**' (recursive wildcard).
 			if (!/^[-a-zA-Z0-9._\/*]+$/.test(path)) {
 				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
-				continue
+				continue // Skip invalid paths
 			}
 
+			// Convert to absolute path and normalise traversals
 			path = nodePath.join(this.dataDirectory, path)
 
+			// Ensure path doesn't escape the app's data directory
 			if (!path.startsWith(this.dataDirectory)) {
 				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
-				continue
+				continue // Skip paths that escape the app's data directory
 			}
 
+			// Save the sanitised path
 			backupIgnore.push(path)
 		}
 
@@ -380,6 +432,7 @@ export default class App {
 
 	// Returns a specific widget's data
 	async getWidgetData(widgetId: string) {
+		// Get widget info from the app's manifest
 		const widgetMetadata = await this.getWidgetMetadata(widgetId)
 
 		const url = new URL(`http://${widgetMetadata.endpoint}`)
