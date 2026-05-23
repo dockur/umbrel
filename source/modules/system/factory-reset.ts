@@ -1,9 +1,4 @@
-import path from 'node:path'
-
-import {$} from 'execa'
 import type Umbreld from '../../index.js'
-
-const BACKUP_PREFIX = 'umbrel-factory-reset'
 
 // Factory reset using Rugix Ctrl's state management. This triggers an immediate reboot.
 // We use the --backup flag which renames the old state directory instead of deleting

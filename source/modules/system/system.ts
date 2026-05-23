@@ -549,37 +549,6 @@ export async function getNetworkInterfaces(umbreld?: Umbreld): Promise<NetworkIn
 	return []
 }
 
-// Find an interface by MAC address
-async function getInterfaceByMac(mac: string): Promise<NetworkInterface> {
-	const networkInterface = (await getNetworkInterfaces()).find((iface) => iface.mac === mac)
-	if (networkInterface) return networkInterface
-	throw new Error(`No interface found with MAC address ${mac}`)
-}
-
-// Find the saved connection name for a device, even if it's not currently connected
-async function getConnectionByDevice(device: string): Promise<string | false> {
-	return false
-}
-
-// Apply a static IP configuration to an interface via nmcli
-async function applyStaticIp({
-	mac,
-	ip,
-	subnetPrefix,
-	gateway,
-	dns,
-}: {
-	mac: string
-	ip: string
-	subnetPrefix: number
-	gateway: string
-	dns: string[]
-}) {
-	const {id: device} = await getInterfaceByMac(mac)
-
-	return device
-}
-
 // Track confirmed static IP — set by confirmStaticIp endpoint when client pings back
 let confirmedStaticIp = ''
 

@@ -1,11 +1,7 @@
 import fse from 'fs-extra'
-import {z} from 'zod'
 import yaml from 'js-yaml'
 
 import type Umbreld from '../../index.js'
-
-import {detectDevice, commitOsPartition} from '../system/system.js'
-import {findExternalUmbrelInstall, runPreMigrationChecks, migrateData} from '../migration/migration.js'
 
 async function readYaml(path: string) {
 	return yaml.load(await fse.readFile(path, 'utf8'))
@@ -25,67 +21,6 @@ class Migration {
 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
 	}
 
-	// One off migration to complete the Mender to Rugix state migration
-	// On the initial boot after a Mender to Rugix migration, the OS overlay path is a symbolic link.
-	// This allows the system to boot and come online but some state management features are broken in this state.
-	// An additional rugix commit and then reboot is required to complete the migration.
-	async finalizeMenderToRugixStateMigration() {
-		const osPersistentOverlayPath = '/data/umbrel-os'
-
-		const isSymbolicLink = (await fse.lstat(osPersistentOverlayPath)).isSymbolicLink()
-		// TODO: Check with Maxi how safe this is. If there's any scenario where Rugix won't migrate the symlink overlay
-		// into a real directory overlay then this can result in an infinite boot loop.
-		if (!isSymbolicLink) return {reboot: false}
-
-		// This should only ever happen once. We allow 3 attempts to handle edge cases or situations where some random failures happen.
-		// If it fails consistently then we'll give up to prevent a boot loop.
-		const menderToRugixMigrationAttempt = (await this.umbreld.store.get('migration.menderToRugixAttempt')) || 0
-		if (menderToRugixMigrationAttempt >= 3) {
-			this.logger.error('Mender to Rugix state migration has been attempted 5 times, giving up to prevent a boot loop!')
-			return {reboot: false}
-		}
-
-		// Increment the attempt count
-		await this.umbreld.store.set('migration.menderToRugixAttempt', menderToRugixMigrationAttempt + 1)
-
-		// Finalize the migration by committing the OS partition and rebooting
-		this.logger.log(
-			'OS overlay path is a symbolic link, committing and rebooting to complete Mender to Rugix state migration...',
-		)
-		// This should've already happened in umbreld.start() but we'll just explicitly do it again here to be sure.
-		await commitOsPartition(this.umbreld)
-		return {reboot: true}
-	}
-
-	// One off migration for legacy custom Linux install users
-	async migrateLegacyLinuxData() {
-		const {deviceId} = await detectDevice()
-
-		// Only run this on unknown devices AKA not a Home or a Pi
-		if (deviceId !== 'unknown') return
-
-		// Don't do anything if a user has already been registered
-		if (await this.umbreld.user.exists()) return
-
-		this.logger.log(
-			'Unkown device booting for the first time, checking if we need to migrate legacy Linux install data...',
-		)
-
-		const externalUmbrelInstall = await findExternalUmbrelInstall()
-		if (!externalUmbrelInstall) {
-			this.logger.log('No legacy Linux install found, skipping migration')
-			return
-		}
-
-		this.logger.log('Legacy Linux install found, migrating data...')
-
-		const currentInstall = this.umbreld.dataDirectory
-		await runPreMigrationChecks(currentInstall, externalUmbrelInstall as string, this.umbreld, false)
-		await this.umbreld.server.start()
-		await migrateData(currentInstall, externalUmbrelInstall as string, this.umbreld)
-		this.logger.log('Migration complete!')
-	}
-
 	async activateImportedDataDirectory() {
 		const importData = `${this.umbreld.dataDirectory}/import`
 		const importDataExists = await fse.exists(importData)
@@ -100,50 +35,6 @@ class Migration {
 		const temporaryData = `${this.umbreld.dataDirectory}-import-temp`
 		await fse.move(importData, temporaryData, {overwrite: true})
 		await fse.move(temporaryData, this.umbreld.dataDirectory, {overwrite: true})
-	}
-
-	async migrateLegacyData() {
-		// Check for a legacy <1.0 Umbrel data directory
-		const userJsonPath = `${this.umbreld.dataDirectory}/db/user.json`
-		const userJsonExists = await fse.exists(userJsonPath)
-		if (!userJsonExists) return
-		this.logger.log('Found legacy Umbrel data, migrating...')
-
-		// Validate the data
-		const legacyDataSchema = z.object({
-			name: z.string(),
-			password: z.string(),
-			installedApps: z.array(z.string()).optional(),
-			repos: z.array(z.string()),
-			remoteTorAccess: z.boolean().optional(),
-			otpUri: z.string().optional(),
-		})
-		const legacyDataJson = await fse.readJson(userJsonPath)
-		const legacyData = legacyDataSchema.parse(legacyDataJson)
-
-		// Migrate data
-		await this.umbreld.user.setName(legacyData.name)
-		await this.umbreld.user.setHashedPassword(legacyData.password)
-		if (legacyData.otpUri) await this.umbreld.user.enable2fa(legacyData.otpUri)
-		await this.umbreld.store.set('appRepositories', legacyData.repos)
-		if (legacyData.installedApps) await this.umbreld.store.set('apps', legacyData.installedApps)
-		if (legacyData.remoteTorAccess) await this.umbreld.store.set('torEnabled', legacyData.remoteTorAccess)
-
-		// Showcase widgets for migrating users
-		await this.umbreld.store.set('widgets', ['umbrel:memory', 'umbrel:system-stats', 'umbrel:storage'])
-
-		// Ensure we have app repositories pulled otherwise there will be a race condition where
-		// if an app gets started before the repo has completed it's initial pull on startup we'll
-		// get the error `App with ID <appId> not found in any repository `
-		await this.umbreld.appStore.update()
-
-		// Mark the legacy file as migrated
-		await fse.move(userJsonPath, `${userJsonPath}.migrated`)
-
-		// Move the .env file so env vars don't get preserved
-		const envPath = `${this.umbreld.dataDirectory}/.env`
-		await fse.move(envPath, `${envPath}.migrated`)
-		this.logger.log('Migration successful')
 	}
 
 	async migrateBackThatMacUpPort() {

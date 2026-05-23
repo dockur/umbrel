@@ -1,7 +1,4 @@
-import nodePath from 'node:path'
-
 import fse from 'fs-extra'
-import {$} from 'execa'
 
 import randomToken from '../utilities/random-token.js'
 
@@ -12,7 +9,6 @@ export default class Samba {
 	#umbreld: Umbreld
 	logger: Umbreld['logger']
 	#removeFileChangeListener?: () => void
-	#removeExternalStorageChangeListener?: () => void
 
 	constructor(umbreld: Umbreld) {
 		this.#umbreld = umbreld
@@ -64,24 +60,6 @@ export default class Samba {
 	async applyShares({excludePaths}: {excludePaths?: string[]} = {}) {
 		// Samba is not started in Docker mode
 		return
-	}
-
-    // Compute a client-facing sharename so that shares are easily detectable in clients
-	async #computeSharename(name: string, path: string) {
-		// Default to "name (Umbrel)"
-		let sharename = `${name} (Umbrel)`
-		if (path === '/Home') {
-			// But Share /Home as "username's Umbrel"
-			const user = await this.#umbreld.user.get()
-			const username = user?.name
-			if (username) sharename = `${username}'s Umbrel`
-		}
-		return sharename
-	}
-
-	// Read current shares from the store
-	async #get() {
-		return []
 	}
 
     // Remove shares on deletion
