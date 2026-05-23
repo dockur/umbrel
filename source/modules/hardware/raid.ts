@@ -87,8 +87,10 @@ export default class Raid {
 	#umbreld: Umbreld
 	logger: Umbreld['logger']
 	configStore: FileStore<ConfigStore>
-	isTransitioningToFailsafe = false
+	isReplacing = false
 	failsafeTransitionStatus?: FailsafeTransitionStatus
+	replaceStatus?: ReplaceStatus
+	initialRaidSetupError?: Error
 	poolNameBase = 'umbrelos'
 	temporaryDevicePath = '/tmp/umbrelos-temporary-migration-device.img'
 
