@@ -88,6 +88,7 @@ export default class Raid {
 	#umbreld: Umbreld
 	logger: Umbreld['logger']
 	configStore: FileStore<ConfigStore>
+	isTransitioningToFailsafe = false
 	isReplacing = false
 	failsafeTransitionStatus?: FailsafeTransitionStatus
 	replaceStatus?: ReplaceStatus
