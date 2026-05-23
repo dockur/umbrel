@@ -65,6 +65,7 @@ type AcceleratorConfig = {
 	devices: string[]
 }
 
+// Types for zpool status --json --json-int --json-flat-vdevs output
 type State = 'ONLINE' | 'DEGRADED' | 'FAULTED' | 'OFFLINE' | 'UNAVAIL' | 'REMOVED' | 'CANT_OPEN'
 
 type ConfigStore = {
