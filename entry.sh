@@ -17,6 +17,8 @@ if [ ! -S /var/run/docker.sock ]; then
   error "Docker socket is missing? Please bind /var/run/docker.sock in your compose file." && exit 13
 fi
 
+cid=""
+name=""
 subnet="10.21.0.0/16"
 net="umbrel_main_network"
 
@@ -32,24 +34,34 @@ if ! docker network inspect "$net" &>/dev/null; then
 fi
 
 # Determine container name
-cid=""
-cid=$(grep -oE '[0-9a-f]{64}' /proc/self/cgroup | head -n1)
-[ -z "$cid" ] && cid=$(grep -m1 "containers" /proc/self/mountinfo | sed -E 's#.*/containers/([^/]+)/.*#\1#')
-[ -z "$cid" ] && error "Failed to get the container CID!" && exit 16
+cid=$(grep -oE '[0-9a-f]{64}' /proc/self/cgroup | head -n1) || :
+[ -z "$cid" ] && cid=$(grep -m1 "containers" /proc/self/mountinfo | sed -E 's#.*/containers/([^/]+)/.*#\1#') || :
 
-target=$(docker inspect -f '{{.Name}}' "$cid" | sed 's#^/##')
+if [ -n "$cid" ]; then
+  name=$(docker inspect -f '{{.Name}}' "$cid" | sed 's#^/##')
+  [ -z "$name" ] && name="$cid"
+else
+  name=$(
+    docker ps -q |
+    xargs -r docker inspect --format '{{.Name}} {{.Config.Hostname}}' |
+    awk -v t="$(hostname -s)" '$2 == t { print substr($1, 2); exit }'
+  ) || :
+  [ -z "$name" ] && name=$(hostname -s)
+fi
+
+[ -z "$name" ] && error "Failed to detect the container name!" && exit 16
 
 # Check if container name is valid
-if ! docker inspect "$target" &>/dev/null; then
-  error "Failed to find a container with name: '$target'!" && exit 16
+if ! docker inspect "$name" &>/dev/null; then
+  error "Failed to find a container with name '$name'!" && exit 16
 fi
 
 # Connect to bridge network
-resp=$(docker inspect "$target")
+resp=$(docker inspect "$name")
 network=$(echo "$resp" | jq -r ".[0].NetworkSettings.Networks[\"$net\"]")
 
 if [ -z "$network" ] || [[ "$network" == "null" ]]; then
-  if ! docker network connect "$net" "$target"; then
+  if ! docker network connect "$net" "$name"; then
     error "Failed to connect container to bridge network '$net'!" && exit 17
   fi
 fi
