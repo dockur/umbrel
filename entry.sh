@@ -90,7 +90,9 @@ fi
 
 # Mirror external folder to local filesystem
 if [[ "$mount" != "/data" ]]; then
-  ln -sfn /data "$mount"
+  mkdir -p "$mount"
+  rm -rf "$mount"
+  ln -s /data "$mount"
 fi
 
 # Create directories
