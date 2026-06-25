@@ -75,7 +75,7 @@ docker run -it --rm --name umbrel --pid=host -p 80:80 -v "${PWD:-.}/umbrel:/data
   See [dockur/zima](https://github.com/dockur/zima) for a ZimaOS container.
 
 ## Stars 🌟
-[![Stars](https://starchart.cc/dockur/umbrel.svg?variant=adaptive)](https://starchart.cc/dockur/umbrel)
+[![Stargazers](https://raw.githubusercontent.com/star-stats/stars/refs/heads/data/charts/dockur-umbrel.svg)](https://github.com/dockur/umbrel/stargazers)
 
 [build_url]: https://github.com/dockur/umbrel/
 [hub_url]: https://hub.docker.com/r/dockurr/umbrel
