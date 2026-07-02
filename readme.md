@@ -20,7 +20,7 @@ Docker container of [Umbrel](https://umbrel.com/umbrelos) (an OS for self-hostin
 
 ## Usage  🐳
 
-##### Via Docker Compose:
+##### Docker Compose:
 
 ```yaml
 services:
@@ -37,13 +37,13 @@ services:
     stop_grace_period: 1m
 ```
 
-##### Via Docker CLI:
+##### Docker CLI:
 
 ```bash
 docker run -it --rm --name umbrel --pid=host -p 80:80 -v "${PWD:-.}/umbrel:/data" -v "/var/run/docker.sock:/var/run/docker.sock" --stop-timeout 60 docker.io/dockurr/umbrel
 ```
 
-##### Via GitHub Codespaces:
+##### GitHub Codespaces:
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/dockur/umbrel)
 
