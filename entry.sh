@@ -25,11 +25,8 @@ subnet="${SUBNET:-10.21.0.0/16}"
 
 current_subnet=""
 
-if docker network inspect "$net" &>/dev/null; then
-  current_subnet="$(
-    docker network inspect "$net" |
-      jq -r '.[0].IPAM.Config[0].Subnet // ""'
-  )"
+if network_json=$(docker network inspect "$net" 2>/dev/null); then
+  current_subnet="$(jq -r '.[0].IPAM.Config[0].Subnet // ""' <<<"$network_json")"
 fi
 
 if [ -n "$current_subnet" ] && [ "$current_subnet" != "$subnet" ]; then
