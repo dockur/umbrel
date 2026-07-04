@@ -110,6 +110,8 @@ if [[ "$mount" != "/data" ]]; then
       ;;
   esac
 
+  mkdir -p "$(dirname -- "$mount")"
+
   if [ -e "$mount" ] && [ ! -L "$mount" ]; then
     error "Mount path already exists and is not a symlink: $mount" && exit 21
   fi
