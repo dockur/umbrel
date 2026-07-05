@@ -16,9 +16,11 @@ Docker container of [Umbrel](https://umbrel.com/umbrelos), an OS for self-hostin
 
 ## Features ✨
 
+- Runs UmbrelOS inside a Docker container
 - Does not need dedicated hardware or a virtual machine
 - Provides access to the Umbrel web interface
 - Supports installing and running Umbrel apps
+- Uses the host Docker daemon for app containers
 
 ## Usage  🐳
 
