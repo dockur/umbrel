@@ -138,7 +138,7 @@ EOF
 # COPY --chmod=664 ./smb.conf /etc/samba/smb.conf
 
 # Install umbreld
-COPY --chmod=755 ./entry.sh /run/
+COPY --chmod=755 ./entrypoint.sh /run/entry.sh
 COPY --from=be-build --chmod=755 /opt/umbreld /opt/umbreld
 
 VOLUME /data
