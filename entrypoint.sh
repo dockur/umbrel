@@ -23,6 +23,7 @@ checkEnvironment() {
 }
 
 configureNetwork() {
+
   local current_subnet=""
   local network_json=""
 
@@ -52,6 +53,7 @@ configureNetwork() {
 }
 
 detectContainerId() {
+
   cid=$(grep -oE '[0-9a-f]{12,64}' /proc/self/cgroup | head -n1 || :)
   [ -z "$cid" ] && cid=$(grep -m1 "containers" /proc/self/mountinfo | sed -E 's#.*/containers/([^/]+)/.*#\1#') || :
 
@@ -59,28 +61,31 @@ detectContainerId() {
 }
 
 detectContainerNameFromId() {
-  if [ -n "$cid" ]; then
-    name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##') || :
-    [ -z "$name" ] && name="$cid"
-  fi
+
+  [ -z "$cid" ] && return 0
+  name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##') || :
+  [ -z "$name" ] && name="$cid"
 
   return 0
 }
 
 detectContainerNameFromHostname() {
-  if [ -z "$name" ]; then
-    name=$(
-      docker ps -q |
-      xargs -r docker inspect --format '{{.Name}} {{.Config.Hostname}}' |
-      awk -v t="$host" '$2 == t { print substr($1, 2); exit }'
-    ) || :
-    [ -z "$name" ] && name="$host"
-  fi
+
+  [ -n "$name" ] && return 0
+
+  name=$(
+    docker ps -q |
+    xargs -r docker inspect --format '{{.Name}} {{.Config.Hostname}}' |
+    awk -v t="$host" '$2 == t { print substr($1, 2); exit }'
+  ) || :
+
+  [ -z "$name" ] && name="$host"
 
   return 0
 }
 
 detectContainerName() {
+
   # Determine container name
   detectContainerId
   detectContainerNameFromId
@@ -95,6 +100,7 @@ detectContainerName() {
 }
 
 inspectContainer() {
+
   # Inspect the container
   resp=$(docker inspect "$name") || {
     error "Failed to inspect container $name!" && exit 16
@@ -104,6 +110,7 @@ inspectContainer() {
 }
 
 connectNetwork() {
+
   local network
 
   # Connect to bridge network
@@ -119,6 +126,7 @@ connectNetwork() {
 }
 
 detectDataMount() {
+
   mount=$(echo "$resp" | jq -r '.[0].Mounts[] | select(.Destination == "/data").Source')
 
   if [ -z "$mount" ] || [[ "$mount" == "null" ]] || [ ! -d "/data" ]; then
@@ -129,6 +137,7 @@ detectDataMount() {
 }
 
 normalizeMountPath() {
+
   # Convert Windows paths to Linux path
   if [[ "$mount" == *":\\"* ]]; then
     mount="${mount,,}"
@@ -144,6 +153,7 @@ normalizeMountPath() {
 }
 
 mirrorDataMount() {
+
   # Mirror external folder to local filesystem
   if [[ "$mount" == "/data" ]]; then
     return 0
@@ -168,6 +178,7 @@ mirrorDataMount() {
 }
 
 prepareDirectories() {
+
   # Create directories
   mkdir -p "/images"
   mkdir -p "$mount/tor/data"
