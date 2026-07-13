@@ -369,54 +369,15 @@ export async function commitOsPartition(umbreld: Umbreld): Promise<boolean> {
 }
 
 export async function detectDevice() {
-	let {manufacturer, model, serial, uuid, sku, version} = await systemInformation.system()
-	let productName = model
-	model = sku
-	let device = productName // TODO: Maybe format this better in the future.
-
-	// Used for update server
-	let deviceId = 'unknown'
-
-	if (model === 'U130120') device = 'Umbrel Home (2023)'
-	if (model === 'U130121') device = 'Umbrel Home (2024)'
-	if (model === 'U130122') device = 'Umbrel Home (2025)'
-	if (productName === 'Umbrel Home') deviceId = model
-
-	// No year suffix for Umbrel Pro until if/when a newer model exists
-	if (model === 'U4XN1') device = 'Umbrel Pro'
-	if (productName === 'Umbrel Pro') deviceId = model
-
-	// I haven't been able to find another way to reliably detect Pi hardware. Most existing
-	// solutions don't actually detect Pi hardware but just detect Pi OS which we don't match.
-	// e.g systemInformation includes Pi detection which fails here. Also there's no SMBIOS so
-	// no values like manufacturer or model to check. I did notice the Raspberry Pi model is
-	// appended to the output of `/proc/cpuinfo` so we can use that to detect Pi hardware.
-	try {
-		const cpuInfo = await fse.readFile('/proc/cpuinfo')
-		if (cpuInfo.includes('Raspberry Pi ')) {
-			manufacturer = 'Raspberry Pi'
-			productName = 'Raspberry Pi'
-			model = version
-			if (cpuInfo.includes('Raspberry Pi 5 ')) {
-				device = 'Raspberry Pi 5'
-				deviceId = 'pi-5'
-			}
-			if (cpuInfo.includes('Raspberry Pi 4 ')) {
-				device = 'Raspberry Pi 4'
-				deviceId = 'pi-4'
-			}
-		}
-	} catch {
-		// /proc/cpuinfo might not exist on some systems, do nothing.
+	return {
+		deviceId: 'docker',
+		device: 'Umbrel for Docker',
+		productName: 'Umbrel for Docker',
+		manufacturer: 'Docker',
+		model: '',
+		serial: '',
+		uuid: '',
 	}
-
-	// Blank out model and serial for non Umbrel devices
-	if (productName !== 'Umbrel Home' && productName !== 'Umbrel Pro') {
-		model = ''
-		serial = ''
-	}
-
-	return {deviceId, device, productName, manufacturer, model, serial, uuid}
 }
 
 export async function isRaspberryPi() {
