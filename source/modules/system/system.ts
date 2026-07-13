@@ -549,8 +549,10 @@ export async function waitForSystemTime(umbreld: Umbreld, timeout: number): Prom
 }
 
 export async function getHostname() {
-	const hostname = await fse.readFile('/etc/hostname', 'utf8')
-	return hostname.trim()
+	const containerName = process.env.UMBREL_CONTAINER_NAME
+	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
+
+	return containerName
 }
 
 async function applyHostname(umbreld: Umbreld, hostname: string) {
