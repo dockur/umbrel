@@ -7,7 +7,7 @@ import {type Compose} from 'compose-spec-schema'
 import {$} from 'execa'
 import fetch from 'node-fetch'
 import stripAnsi from 'strip-ansi'
-import pRetry from 'p-retry'
+import pRetry, {AbortError} from 'p-retry'
 
 import getDirectorySize from '../utilities/get-directory-size.js'
 import {pullAll} from '../utilities/docker-pull.js'
@@ -25,18 +25,7 @@ async function writeYaml(path: string, data: any) {
 	return fse.writeFile(path, yaml.dump(data))
 }
 
-async function patchYaml(path: string) {
-	let yaml = await fse.readFile(path, 'utf8')
-
-	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
-	if (!yaml.includes(find)) return true
-	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT')
-
-	await fse.writeFile(path, yaml)
-	return true
-}
-
-function translateDockerPortError(error: unknown) {
+function getDockerPortError(error: unknown) {
 	const details = [
 		error instanceof Error ? error.message : '',
 		typeof (error as {stderr?: unknown})?.stderr === 'string' ? (error as {stderr: string}).stderr : '',
@@ -45,9 +34,7 @@ function translateDockerPortError(error: unknown) {
 		.filter(Boolean)
 		.join('\n')
 
-	if (!/(port is already allocated|address already in use|bind .* failed)/i.test(details)) {
-		return error instanceof Error ? error : new Error(String(error))
-	}
+	if (!/(port is already allocated|address already in use|bind .* failed)/i.test(details)) return
 
 	const port =
 		details.match(/(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::):([0-9]+)/)?.[1] ||
@@ -60,12 +47,29 @@ function translateDockerPortError(error: unknown) {
 	return new Error(message, {cause: error})
 }
 
+function abortOnDockerPortError(error: unknown): never {
+	const portError = getDockerPortError(error)
+	if (portError) throw new AbortError(portError)
+	throw error
+}
+
 async function reportDockerPortError<T>(operation: () => Promise<T>) {
 	try {
 		return await operation()
 	} catch (error) {
-		throw translateDockerPortError(error)
+		throw getDockerPortError(error) || error
 	}
+}
+
+async function patchYaml(path: string) {
+	let yaml = await fse.readFile(path, 'utf8')
+
+	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
+	if (!yaml.includes(find)) return true
+	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT')
+
+	await fse.writeFile(path, yaml)
+	return true
 }
 
 export async function readManifestInDirectory(dataDirectory: string) {
@@ -195,6 +199,7 @@ export default class App {
 		const images = Object.values(compose.services!)
 			.map((service) => service.image)
 			.filter(Boolean) as string[]
+
 		await pullAll([...defaultImages, ...images], (progress) => {
 			this.stateProgress = Math.max(1, progress * 99)
 			this.logger.log(`Downloaded ${this.stateProgress}% of app ${this.id}`)
@@ -208,8 +213,15 @@ export default class App {
 		await this.patchComposeFile()
 		await this.pull()
 
-		await reportDockerPortError(() =>
-			pRetry(() => appScript(this.#umbreld, 'install', this.id), {
+		await pRetry(
+			async () => {
+				try {
+					return await appScript(this.#umbreld, 'install', this.id)
+				} catch (error) {
+					abortOnDockerPortError(error)
+				}
+			},
+			{
 				onFailedAttempt: (error) => {
 					this.logger.error(
 						`Attempt ${error.attemptNumber} installing app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
@@ -217,7 +229,7 @@ export default class App {
 					)
 				},
 				retries: 2,
-			}),
+			},
 		)
 
 		this.state = 'ready'
@@ -270,8 +282,15 @@ export default class App {
 		// wont run because they haven't been patched.
 		await this.patchComposeFile()
 
-		await reportDockerPortError(() =>
-			pRetry(() => appScript(this.#umbreld, 'start', this.id), {
+		await pRetry(
+			async () => {
+				try {
+					return await appScript(this.#umbreld, 'start', this.id)
+				} catch (error) {
+					abortOnDockerPortError(error)
+				}
+			},
+			{
 				onFailedAttempt: (error) => {
 					this.logger.error(
 						`Attempt ${error.attemptNumber} starting app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
@@ -279,7 +298,7 @@ export default class App {
 					)
 				},
 				retries: 2,
-			}),
+			},
 		)
 
 		this.state = 'ready'
@@ -301,6 +320,7 @@ export default class App {
 			},
 			retries: 2,
 		})
+
 		this.state = 'stopped'
 
 		// Disable auto-start on boot
@@ -334,6 +354,7 @@ export default class App {
 			},
 			retries: 2,
 		})
+
 		await appScript(this.#umbreld, 'nuke-images', this.id)
 		await fse.remove(this.dataDirectory)
 
@@ -366,6 +387,7 @@ export default class App {
 
 	async getPids() {
 		const containers = await this.getContainerNames()
+
 		try {
 			// If we fail to get the PIDs of one container, skip it and continue for
 			// the other containers. We'll expect to get it on some misses for the app
@@ -501,9 +523,9 @@ export default class App {
 		} catch (error) {
 			if (error instanceof Error) {
 				throw new Error(`Failed to fetch data from ${url}: ${error.message}`)
-			} else {
-				throw new Error(`An unexpected error occured while fetching data from ${url}: ${error}`)
 			}
+
+			throw new Error(`An unexpected error occured while fetching data from ${url}: ${error}`)
 		}
 	}
 
@@ -513,6 +535,7 @@ export default class App {
 			this.readManifest(),
 			this.getSelectedDependencies(),
 		])
+
 		return dependencies?.map((dependencyId) => selectedDependencies?.[dependencyId] ?? dependencyId) ?? []
 	}
 
@@ -522,6 +545,7 @@ export default class App {
 			this.readManifest(),
 			this.store.get('dependencies'),
 		])
+
 		return fillSelectedDependencies(dependencies, selectedDependencies)
 	}
 
@@ -530,11 +554,13 @@ export default class App {
 		const {dependencies} = await this.readManifest()
 		const filledSelectedDependencies = fillSelectedDependencies(dependencies, selectedDependencies)
 		const success = await this.store.set('dependencies', filledSelectedDependencies)
+
 		if (success) {
 			this.restart().catch((error) => {
 				this.logger.error(`Failed to restart '${this.id}'`, error)
 			})
 		}
+
 		return success
 	}
 
