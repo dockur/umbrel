@@ -150,7 +150,8 @@ derive_entropy () {
 source_app() {
   local -r app="${1}"
 
-  local -r app_domain="$(hostname -s 2>/dev/null || echo "umbrel").local"
+  local -r device_hostname="${UMBREL_CONTAINER_NAME:-$(hostname -s 2>/dev/null || echo "umbrel")}"
+  local -r app_domain="${device_hostname}.local"
   local -r app_entropy_identifier="app-${app}-seed"
 
   # Load in existing Umbrel .env
@@ -161,7 +162,7 @@ source_app() {
   export NETWORK_IP="${NETWORK_IP}"
 
   # Set other useful vars. used in exports
-  export DEVICE_HOSTNAME="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "umbrel")"
+  export DEVICE_HOSTNAME="${device_hostname}"
   export DEVICE_DOMAIN_NAME="${DEVICE_HOSTNAME}.local"
 
   # Set env using all transitive dependencies exports.sh
