@@ -1,13 +1,11 @@
 import os from 'node:os'
 import {setTimeout} from 'node:timers/promises'
 
-import {TRPCError} from '@trpc/server'
 import {z} from 'zod'
 import {$} from 'execa'
 import fse from 'fs-extra'
 import stripAnsi from 'strip-ansi'
 
-import {performReset} from './factory-reset.js'
 import {getUpdateStatus, performUpdate, getLatestRelease} from './update.js'
 import {
 	getCpuTemperature,
@@ -41,6 +39,7 @@ export function setSystemStatus(status: SystemStatus) {
 
 export default router({
 	online: publicProcedure.query(() => true),
+
 	version: publicProcedure.query(async ({ctx}) => {
 		return {
 			version: ctx.umbreld.version,
@@ -48,18 +47,31 @@ export default router({
 			previousVersion: await ctx.umbreld.store.get('previousVersion'),
 		}
 	}),
+
 	status: publicProcedure.query(() => systemStatus),
+
 	updateStatus: privateProcedure.query(() => getUpdateStatus()),
+
 	uptime: privateProcedure.query(() => os.uptime()),
+
 	checkUpdate: privateProcedure.query(async ({ctx}) => {
-		let {version, name, releaseNotes} = await getLatestRelease(ctx.umbreld)
+		const {version, name, releaseNotes} = await getLatestRelease(ctx.umbreld)
+
 		// v prefix is needed in the tag name for legacy reasons, remove it before comparing to local version
 		const available = version.replace('v', '') !== ctx.umbreld.version
-		return {available, version, name, releaseNotes}
+
+		return {
+			available,
+			version,
+			name,
+			releaseNotes,
+		}
 	}),
+
 	getReleaseChannel: privateProcedure.query(async ({ctx}) => {
 		return (await ctx.umbreld.store.get('settings.releaseChannel')) || 'stable'
 	}),
+
 	setReleaseChannel: privateProcedure
 		.input(
 			z.object({
@@ -69,56 +81,83 @@ export default router({
 		.mutation(async ({ctx, input}) => {
 			return ctx.umbreld.store.set('settings.releaseChannel', input.channel)
 		}),
+
 	isExternalDns: privateProcedure.query(async ({ctx}) => {
 		return await ctx.umbreld.store.get('settings.externalDns', true)
 	}),
+
 	setExternalDns: privateProcedure.input(z.boolean()).mutation(async ({ctx, input}) => {
 		const previousExternalDns = await ctx.umbreld.store.get('settings.externalDns', true)
+
 		if (previousExternalDns === input) return true
+
 		await ctx.umbreld.store.set('settings.externalDns', input)
+
 		try {
 			const success = await syncDns()
-			if (!success) throw new Error('Failed to synchronize external DNS setting')
+
+			if (!success) {
+				throw new Error('Failed to synchronize external DNS setting')
+			}
+
 			return true
 		} catch (error) {
 			await ctx.umbreld.store.set('settings.externalDns', previousExternalDns)
 			throw error
 		}
 	}),
+
 	update: privateProcedure.mutation(async ({ctx}) => {
 		systemStatus = 'updating'
 		let success = false
+
 		try {
 			success = await performUpdate(ctx.umbreld)
+
 			if (success) {
 				await setTimeout(1000)
 				await ctx.umbreld.stop()
 				await reboot()
 			}
 		} finally {
-			if (!success) systemStatus = 'running'
+			if (!success) {
+				systemStatus = 'running'
+			}
 		}
+
 		return success
 	}),
+
 	hiddenService: privateProcedure.query(async ({ctx}) => {
 		try {
 			return await fse.readFile(`${ctx.umbreld.dataDirectory}/tor/data/web/hostname`, 'utf-8')
 		} catch (error) {
-			ctx.umbreld.logger.error(`Failed to read hidden service for ui`, error)
+			ctx.umbreld.logger.error('Failed to read hidden service for ui', error)
 			return ''
 		}
 	}),
+
 	// Public during onboarding to show device-specific UI (Pro/Home images, video background)
 	device: publicProcedureWhenNoUserExists.query(() => detectDevice()),
+
 	cpuTemperature: privateProcedure.query(() => getCpuTemperature()),
+
 	systemDiskUsage: privateProcedure.query(({ctx}) => getSystemDiskUsage(ctx.umbreld)),
+
 	diskUsage: privateProcedure.query(({ctx}) => getDiskUsage(ctx.umbreld)),
+
 	systemMemoryUsage: privateProcedure.query(() => getSystemMemoryUsage()),
+
 	memoryUsage: privateProcedure.query(({ctx}) => getMemoryUsage(ctx.umbreld)),
+
 	cpuUsage: privateProcedure.query(({ctx}) => getCpuUsage(ctx.umbreld)),
+
 	getIpAddresses: privateProcedure.query(() => getIpAddresses()),
+
 	getHostname: privateProcedure.query(() => getHostname()),
+
 	getNetworkInterfaces: privateProcedure.query(({ctx}) => getNetworkInterfaces(ctx.umbreld)),
+
 	setHostname: privateProcedure
 		.input(
 			z.object({
@@ -130,25 +169,44 @@ export default router({
 			}),
 		)
 		.mutation(async ({ctx, input}) => setHostname(ctx.umbreld, input.hostname)),
+
 	setStaticIp: privateProcedure
 		.input(
 			z.object({
 				mac: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i, 'Invalid MAC address'),
-				ip: z.string().ip({version: 'v4', message: 'Invalid IPv4 address'}),
+				ip: z.string().ip({
+					version: 'v4',
+					message: 'Invalid IPv4 address',
+				}),
 				subnetPrefix: z.number().int().min(0).max(32),
-				gateway: z.string().ip({version: 'v4', message: 'Invalid IPv4 gateway'}),
-				dns: z.array(z.string().ip({version: 'v4', message: 'Invalid IPv4 DNS address'})).min(1),
+				gateway: z.string().ip({
+					version: 'v4',
+					message: 'Invalid IPv4 gateway',
+				}),
+				dns: z
+					.array(
+						z.string().ip({
+							version: 'v4',
+							message: 'Invalid IPv4 DNS address',
+						}),
+					)
+					.min(1),
 			}),
 		)
 		.mutation(async ({ctx, input}) => setStaticIp(ctx.umbreld, input)),
+
 	// Public so it can be called from a new origin after an IP change, where no JWT is available.
 	confirmStaticIp: publicProcedure
 		.input(
 			z.object({
-				ip: z.string().ip({version: 'v4', message: 'Invalid IPv4 address'}),
+				ip: z.string().ip({
+					version: 'v4',
+					message: 'Invalid IPv4 address',
+				}),
 			}),
 		)
 		.mutation(async ({input}) => confirmStaticIp(input.ip)),
+
 	clearStaticIp: privateProcedure
 		.input(
 			z.object({
@@ -156,6 +214,7 @@ export default router({
 			}),
 		)
 		.mutation(async ({ctx, input}) => clearStaticIp(ctx.umbreld, input)),
+
 	// Public during onboarding and recovery mode so users can shut down during RAID setup or mount failure
 	shutdown: publicProcedureWhenNoUserExists.mutation(async () => {
 		systemStatus = 'shutting-down'
@@ -163,6 +222,7 @@ export default router({
 
 		return true
 	}),
+
 	// Public during onboarding and recovery mode
 	restart: publicProcedureWhenNoUserExists.mutation(async () => {
 		systemStatus = 'restarting'
@@ -170,6 +230,7 @@ export default router({
 
 		return true
 	}),
+
 	logs: privateProcedure
 		.input(
 			z.object({
@@ -188,33 +249,18 @@ export default router({
 			}
 
 			const logs = await $`docker logs --tail 1500 ${containerName}`
+
 			return stripAnsi(`${logs.stdout}\n${logs.stderr}`.trim())
 		}),
-	//
-	// Public during onboarding and recovery mode - password required unless in recovery mode
+
+	// Factory reset is unavailable because container state is managed through the bound data directory.
 	factoryReset: publicProcedureWhenNoUserExists
 		.input(
 			z.object({
 				password: z.string().optional(),
 			}),
 		)
-		.mutation(async ({ctx, input}) => {
-			// Skip password validation in recovery mode (RAID mount failure) since user data is inaccessible
-			const raidMountFailure = await ctx.umbreld.hardware.raid.checkRaidMountFailure()
-			if (!raidMountFailure) {
-				if (!input.password || !(await ctx.user.validatePassword(input.password))) {
-					throw new TRPCError({code: 'UNAUTHORIZED', message: 'Invalid password'})
-				}
-			}
-			systemStatus = 'resetting'
-			try {
-				// Wait for UI to poll status (polls every 10s) and see we're resetting
-				await setTimeout(11000)
-				// Triggers an immediate reboot via rugix-ctrl
-				await performReset()
-			} catch (error) {
-				systemStatus = 'running'
-				throw error
-			}
+		.mutation(async () => {
+			throw new Error('Factory reset is not supported in Docker. Remove the data volume to reset Umbrel.')
 		}),
 })
