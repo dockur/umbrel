@@ -84,6 +84,8 @@ type ConfigStore = {
 	}
 }
 
+const unsupportedMessage = 'RAID management is not supported in Docker.'
+
 export default class Raid {
 	#umbreld: Umbreld
 	logger: Umbreld['logger']
@@ -100,7 +102,6 @@ export default class Raid {
 		this.#umbreld = umbreld
 		const {name} = this.constructor
 		this.logger = umbreld.logger.createChildLogger(`hardware:${name.toLowerCase()}`)
-
 	}
 
 	async hasConfigStore() {
@@ -124,7 +125,9 @@ export default class Raid {
 
 	// Get status of the main RAID pool with migration error if any
 	async getStatus() {
-		return null
+		return {
+			exists: false,
+		}
 	}
 
 	// Get status of a RAID pool
@@ -157,7 +160,9 @@ export default class Raid {
 		expansion?: ExpansionStatus
 		rebuild?: RebuildStatus
 	}> {
-		return null
+		return {
+			exists: false,
+		}
 	}
 
 	// Trigger initial RAID setup boot process
@@ -167,7 +172,7 @@ export default class Raid {
 		acceleratorDevices: string[] | undefined,
 		user: {name: string; password: string; language: string},
 	) {
-		return true
+		throw new Error(unsupportedMessage)
 	}
 
 	// Handle initial RAID setup after first boot with the new array
@@ -182,12 +187,12 @@ export default class Raid {
 
 	// Check if RAID mount failed during boot
 	async checkRaidMountFailure(): Promise<boolean> {
-		return fse.pathExists('/run/rugix/mounts/data/.rugix/data-mount-error.log')
+		return false
 	}
 
 	// Get details about why RAID mount failed by running a test import
 	async checkRaidMountFailureDevices(): Promise<Array<{name: string; isOk: boolean}>> {
-		return null
+		return []
 	}
 
 	// Setup RAID array from a list of devices
@@ -196,18 +201,18 @@ export default class Raid {
 	// 2. Create a ZFS pool from all data partitions
 	// 3. Write RAID config to boot partition to signal the boot process to mount the array
 	async setup(deviceIds: string[], raidType: RaidType, acceleratorDeviceIds?: string[]): Promise<boolean> {
-		return
+		throw new Error(unsupportedMessage)
 	}
 
 	// Add one device to a stripe (storage) or raidz (failsafe SSD) array.
 	// Mirror failsafe arrays must use addMirror().
 	async addDevice(deviceId: string): Promise<boolean> {
-		return true
+		throw new Error(unsupportedMessage)
 	}
 
 	// Add one mirror pair to a mirror (failsafe HDD) array.
 	async addMirror(deviceIds: [string, string]): Promise<boolean> {
-		return true
+		throw new Error(unsupportedMessage)
 	}
 
 	// Add SSD accelerator device to an HDD pool.
@@ -226,26 +231,26 @@ export default class Raid {
 	// bulk data on HDDs. On a 2TB Umbrel dataset this is ~15GB. 64k would jump to ~150GB which is
 	// unpredictable on larger/different workloads, so we stay conservative.
 	async addAccelerator(deviceIds: string[]): Promise<boolean> {
-		return true
+		throw new Error(unsupportedMessage)
 	}
 
 	// Replace a storage or accelerator device in the RAID array.
 	async replaceDevice(oldDeviceId: string, newDeviceId: string): Promise<boolean> {
-		return
+		throw new Error(unsupportedMessage)
 	}
 
 	// Transition an SSD storage array to a failsafe (raidz1) array.
 	// This creates a degraded raidz1 pool with the new disk and syncs data from the old pool.
 	async transitionToFailsafeRaidz(newDeviceId: string): Promise<boolean> {
-        return
+		throw new Error(unsupportedMessage)
 	}
 
-    // Transition an HDD storage array to failsafe mirrors by attaching a new disk to each existing disk.
-    // This is an in-place operation that does not require a reboot.
-    async transitionToFailsafeMirror(
+	// Transition an HDD storage array to failsafe mirrors by attaching a new disk to each existing disk.
+	// This is an in-place operation that does not require a reboot.
+	async transitionToFailsafeMirror(
 		pairs: FailsafeMirrorTransitionPair[],
 		acceleratorDeviceId?: string,
 	): Promise<boolean> {
-		return false
+		throw new Error(unsupportedMessage)
 	}
 }
