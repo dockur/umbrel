@@ -30,7 +30,7 @@ async function patchYaml(path: string) {
 
 	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
 	if (!yaml.includes(find)) return true
-	yaml = yaml.replace(find, '8558:$APP_LIGHTNING_NODE_REST_PORT');
+	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT');
 
 	await fse.writeFile(path, yaml)
 	return true
