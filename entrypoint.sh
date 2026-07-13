@@ -36,8 +36,7 @@ configureNetwork() {
   fi
 
   if [ -n "$current_subnet" ] && [ "$current_subnet" != "$subnet" ]; then
-    warn "Bridge network '$net' already uses subnet $current_subnet instead of $subnet. Keeping the existing network."
-    subnet="$current_subnet"
+    error "Bridge network '$net' already uses subnet $current_subnet instead of the required subnet $subnet." && exit 14
   fi
 
   if ! docker network inspect "$net" &>/dev/null; then
