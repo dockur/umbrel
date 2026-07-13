@@ -353,7 +353,13 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
 // umbreld gets killed.
 
 export async function shutdown(): Promise<boolean> {
-	process.kill(process.pid, 'SIGTERM')
+	const containerName = process.env.UMBREL_CONTAINER_NAME
+	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
+
+	void (async () => {
+		await setTimeout(250)
+		await $({reject: false})`docker stop --time 100 ${containerName}`
+	})()
 
 	return true
 }
