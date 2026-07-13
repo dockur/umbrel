@@ -159,6 +159,8 @@ checkDataPermissions() {
     warn "The /data folder is not writable by user umbrel (UID 1000). Some apps may have permission issues."
   fi
 
+  rm -f "$test_file"
+
   return 0
 }
 
