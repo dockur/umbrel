@@ -84,6 +84,7 @@ RUN <<EOF
     iputils-ping \
     curl \
     wget \
+    cifs-utils \
     ca-certificates \
     whois \
     e2fsprogs \
