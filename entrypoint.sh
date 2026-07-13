@@ -106,15 +106,19 @@ detectContainerNameFromId() {
 
 detectContainerNameFromHostname() {
 
+  local matches=()
+
   [ -n "$name" ] && return 0
 
-  name=$(
+  mapfile -t matches < <(
     docker ps -q |
     xargs -r docker inspect --format '{{.Name}} {{.Config.Hostname}}' |
-    awk -v t="$host" '$2 == t { print substr($1, 2); exit }'
-  ) || :
+    awk -v target="$host" '$2 == target { print substr($1, 2) }'
+  )
 
-  [ -z "$name" ] && name="$host"
+  if [ "${#matches[@]}" -eq 1 ]; then
+    name="${matches[0]}"
+  fi
 
   return 0
 }
@@ -127,8 +131,8 @@ detectContainerName() {
   detectContainerNameFromHostname
 
   # Check if container name is valid
-  if ! docker inspect "$name" &>/dev/null; then
-    error "Failed to find a container with name $name!" && exit 16
+  if [ -z "$name" ] || ! docker inspect "$name" &>/dev/null; then
+    error "Failed to identify the current container!" && exit 16
   fi
 
   export UMBREL_CONTAINER_NAME="$name"
