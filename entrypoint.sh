@@ -37,14 +37,28 @@ checkDocker() {
 
 configureNetwork() {
 
+  local current_gateway=""
   local current_subnet=""
   local network_json=""
 
   if network_json=$(docker network inspect "$net" 2>/dev/null); then
-    if jq -e --arg subnet "$subnet" 'any(.[0].IPAM.Config[]?; .Subnet == $subnet)' <<<"$network_json" >/dev/null; then
-      current_subnet="$subnet"
+    current_subnet=$(
+      jq -r \
+        --arg subnet "$subnet" \
+        'first(.[0].IPAM.Config[]? | select(.Subnet == $subnet) | .Subnet) // ""' \
+        <<<"$network_json"
+    )
+
+    if [ -n "$current_subnet" ]; then
+      current_gateway=$(
+        jq -r \
+          --arg subnet "$subnet" \
+          'first(.[0].IPAM.Config[]? | select(.Subnet == $subnet) | .Gateway) // ""' \
+          <<<"$network_json"
+      )
     else
-      current_subnet="$(jq -r '.[0].IPAM.Config[0].Subnet // ""' <<<"$network_json")"
+      current_subnet=$(jq -r '.[0].IPAM.Config[0].Subnet // ""' <<<"$network_json")
+      current_gateway=$(jq -r '.[0].IPAM.Config[0].Gateway // ""' <<<"$network_json")
     fi
   fi
 
@@ -52,8 +66,16 @@ configureNetwork() {
     error "Bridge network '$net' already uses subnet $current_subnet instead of the required subnet $subnet." && exit 14
   fi
 
+  if [ -n "$current_subnet" ] && [ "$current_gateway" != "$gateway" ]; then
+    error "Bridge network '$net' already uses gateway ${current_gateway:-unknown} instead of the required gateway $gateway." && exit 14
+  fi
+
   if ! docker network inspect "$net" &>/dev/null; then
-    if ! docker network create --driver=bridge "--subnet=$subnet" "$net" >/dev/null; then
+    if ! docker network create \
+      --driver=bridge \
+      "--subnet=$subnet" \
+      "--gateway=$gateway" \
+      "$net" >/dev/null; then
       error "Failed to create bridge network '$net'!" && exit 14
     fi
   fi
@@ -293,6 +315,7 @@ name=""
 host=$(hostname -s)
 net="umbrel_main_network"
 subnet="10.21.0.0/16"
+gateway="10.21.0.1"
 
 detectContainerName
 inspectContainer
