@@ -220,7 +220,7 @@ cid=""
 name=""
 host=$(hostname -s)
 net="umbrel_main_network"
-subnet="${SUBNET:-10.21.0.0/16}"
+subnet="10.21.0.0/16"
 
 configureNetwork
 detectContainerName
