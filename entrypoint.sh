@@ -156,6 +156,19 @@ checkOtherInstance() {
   return 0
 }
 
+checkPidMode() {
+
+  local pid_mode
+
+  pid_mode=$(jq -r '.[0].HostConfig.PidMode // ""' <<<"$resp")
+
+  if [ "$pid_mode" != "host" ]; then
+    error "Host PID mode is required. Please add 'pid: host' to your compose file." && exit 24
+  fi
+
+  return 0
+}
+
 connectNetwork() {
 
   local network
@@ -270,6 +283,7 @@ subnet="10.21.0.0/16"
 detectContainerName
 inspectContainer
 checkOtherInstance
+checkPidMode
 configureNetwork
 connectNetwork
 detectDataMount
