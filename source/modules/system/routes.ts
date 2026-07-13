@@ -5,7 +5,7 @@ import {$} from 'execa'
 import fse from 'fs-extra'
 import stripAnsi from 'strip-ansi'
 
-import {getUpdateStatus, performUpdate} from './update.js'
+import {getUpdateStatus, performUpdate, getLatestRelease} from './update.js'
 import {
 	getCpuTemperature,
 	getSystemDiskUsage,
@@ -53,12 +53,14 @@ export default router({
 
 	// Docker installations are updated by pulling a newer container image.
 	checkUpdate: privateProcedure.query(async ({ctx}) => {
-		return {
-			available: false,
-			version: ctx.umbreld.version,
-			name: ctx.umbreld.versionName,
-			releaseNotes: '',
+		const {version, name, releaseNotes} = await getLatestRelease(ctx.umbreld)
+		const available = version.replace('v', '') !== ctx.umbreld.version
+
+		if (available) {
+			throw new Error(unsupportedUpdateMessage)
 		}
+
+		return {available, version, name, releaseNotes}
 	}),
 
 	getReleaseChannel: privateProcedure.query(() => 'stable'),
