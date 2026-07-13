@@ -26,11 +26,47 @@ export default class Apps {
 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
 	}
 
-    // Docker: We don't clean Docker state here because entry.sh manages the
-	// umbrel_main_network. Cleaning state would prune that external network
-	// and break app-environment compose.
+	// Clean up stale Umbrel containers without affecting unrelated host workloads.
+	// Network cleanup remains disabled because Compose network labels do not
+	// identify Umbrel ownership reliably enough.
 	async cleanDockerState() {
+		try {
+			const containerIds = (await $`docker ps -aq --filter label=com.docker.compose.project`).stdout
+				.split('\n')
+				.filter(Boolean)
+			if (!containerIds.length) return
 
+			const containers = JSON.parse((await $`docker inspect ${containerIds}`).stdout)
+			const dataDirectory = this.#umbreld.dataDirectory
+			const appDataDirectory = `${dataDirectory}/app-data/`
+			const ownedContainerIds = containers
+				.filter((container: any) => {
+					const labels = container?.Config?.Labels ?? {}
+					const workingDirectory = labels['com.docker.compose.project.working_dir'] ?? ''
+					const configFiles = labels['com.docker.compose.project.config_files'] ?? ''
+
+					return (
+						workingDirectory === dataDirectory ||
+						workingDirectory.startsWith(appDataDirectory) ||
+						configFiles
+							.split(',')
+							.some(
+								(file: string) =>
+									file === `${dataDirectory}/docker-compose.yml` || file.startsWith(appDataDirectory),
+							)
+					)
+				})
+				.map((container: any) => container.Id)
+				.filter(Boolean)
+
+			if (ownedContainerIds.length) {
+				this.logger.log('Cleaning up old Umbrel containers...')
+				await $({stdio: 'inherit'})`docker stop --time 30 ${ownedContainerIds}`
+				await $({stdio: 'inherit'})`docker rm ${ownedContainerIds}`
+			}
+		} catch (error) {
+			this.logger.error('Failed to clean Umbrel containers', error)
+		}
 	}
 
 	async start() {
@@ -128,8 +164,8 @@ export default class Apps {
 				await appEnvironment(this.#umbreld, 'up')
 			} catch (error) {
 				this.logger.error(`Failed to start app environment`, error)
-				// this.logger.log('Attempting to clean Docker state before retrying...')
-				// await this.cleanDockerState()
+				this.logger.log('Attempting to clean Docker state before retrying...')
+				await this.cleanDockerState()
 			}
 			await pRetry(() => appEnvironment(this.#umbreld, 'up'), {
 				onFailedAttempt: (error) => {
