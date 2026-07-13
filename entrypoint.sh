@@ -252,17 +252,6 @@ checkDataPermissions() {
     chown umbrel:umbrel /data 2>/dev/null || :
   fi
 
-  # Warn when the Umbrel user still cannot write to the data folder
-  if ! sudo -u umbrel -- sh -c '
-    umask 077
-    : > "$1"
-    rm -f "$1"
-  ' sh "$test_file" 2>/dev/null; then
-    warn "The /data folder is not writable by user umbrel (UID 1000). Some apps may have permission issues."
-  fi
-
-  rm -f "$test_file"
-
   return 0
 }
 
