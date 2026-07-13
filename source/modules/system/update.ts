@@ -1,7 +1,6 @@
-import {$} from 'execa'
 import type {ProgressStatus} from '../apps/schema.js'
 import {detectDevice, isUmbrelOS} from './system.js'
-import Umbreld from '../../index.js'
+import type Umbreld from '../../index.js'
 
 type UpdateStatus = ProgressStatus
 
@@ -68,19 +67,13 @@ export async function getLatestRelease(umbreld: Umbreld) {
 	return data as {version: string; name: string; releaseNotes: string; updateScript?: string}
 }
 
-export async function performUpdate(umbreld: Umbreld) {
-
-	setUpdateStatus({running: true, progress: 5, description: 'Updating...', error: false})
-        await setTimeout(1000);
-
-	setUpdateStatus({error: 'Updates not supported, update the Docker image instead!'})
-
-	// Reset the state back to running but leave the error message so ui polls
-	// can differentiate between a successful update after reboot and a failed
-	// update that didn't reboot.
-	const errorStatus = updateStatus.error
-	resetUpdateStatus()
-	setUpdateStatus({error: errorStatus})
+export async function performUpdate(_umbreld: Umbreld) {
+	setUpdateStatus({
+		running: false,
+		progress: 0,
+		description: '',
+		error: 'Updates are not supported in Docker. Update the Docker image instead.',
+	})
 
 	return false
 }
