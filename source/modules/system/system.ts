@@ -288,8 +288,11 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
 
 // Returns a list of all processes and their cpu usage
 async function getProcessesCpu() {
-    // In Docker we need to exec into the host PID namespace
-	const top = await $`docker exec --privileged ${os.hostname()} top --batch-mode --iterations 1`
+	const containerName = process.env.UMBREL_CONTAINER_NAME
+	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
+
+	// In Docker we need to exec into the host PID namespace
+	const top = await $`docker exec --privileged ${containerName} top --batch-mode --iterations 1`
 
 	// Get lines
 	const lines = top.stdout.split('\n').map((line) => line.trim().split(/\s+/))
