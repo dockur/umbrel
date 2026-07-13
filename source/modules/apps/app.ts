@@ -30,10 +30,42 @@ async function patchYaml(path: string) {
 
 	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
 	if (!yaml.includes(find)) return true
-	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT');
+	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT')
 
 	await fse.writeFile(path, yaml)
 	return true
+}
+
+function translateDockerPortError(error: unknown) {
+	const details = [
+		error instanceof Error ? error.message : '',
+		typeof (error as {stderr?: unknown})?.stderr === 'string' ? (error as {stderr: string}).stderr : '',
+		typeof (error as {stdout?: unknown})?.stdout === 'string' ? (error as {stdout: string}).stdout : '',
+	]
+		.filter(Boolean)
+		.join('\n')
+
+	if (!/(port is already allocated|address already in use|bind .* failed)/i.test(details)) {
+		return error instanceof Error ? error : new Error(String(error))
+	}
+
+	const port =
+		details.match(/(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::):([0-9]+)/)?.[1] ||
+		details.match(/port[ =:]([0-9]+)/i)?.[1]
+
+	const message = port
+		? `Port ${port} is already in use on the Docker host. Stop the conflicting service before starting this app.`
+		: 'A port required by this app is already in use on the Docker host. Stop the conflicting service before starting this app.'
+
+	return new Error(message, {cause: error})
+}
+
+async function reportDockerPortError<T>(operation: () => Promise<T>) {
+	try {
+		return await operation()
+	} catch (error) {
+		throw translateDockerPortError(error)
+	}
 }
 
 export async function readManifestInDirectory(dataDirectory: string) {
@@ -87,7 +119,7 @@ export default class App {
 		return readYaml(`${this.dataDirectory}/docker-compose.yml`) as Promise<Compose>
 	}
 
-    patchCompose() {
+	patchCompose() {
 		return patchYaml(`${this.dataDirectory}/docker-compose.yml`)
 	}
 
@@ -150,14 +182,14 @@ export default class App {
 		}
 
 		await this.writeCompose(compose)
-        // Docker-specific: patch Lightning REST port mapping
+		// Docker-specific: patch Lightning REST port mapping
 		await this.patchCompose()
 	}
 
 	async pull() {
 		const defaultImages = [
 			'getumbrel/app-proxy:1.7.0@sha256:ec0de0b944a2e63d52fdd82b3760d90a35f8b442d17a8407afdee3af3e842d5a',
-			'ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a'
+			'ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a',
 		]
 		const compose = await this.readCompose()
 		const images = Object.values(compose.services!)
@@ -176,15 +208,18 @@ export default class App {
 		await this.patchComposeFile()
 		await this.pull()
 
-		await pRetry(() => appScript(this.#umbreld, 'install', this.id), {
-			onFailedAttempt: (error) => {
-				this.logger.error(
-					`Attempt ${error.attemptNumber} installing app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
-					error,
-				)
-			},
-			retries: 2,
-		})
+		await reportDockerPortError(() =>
+			pRetry(() => appScript(this.#umbreld, 'install', this.id), {
+				onFailedAttempt: (error) => {
+					this.logger.error(
+						`Attempt ${error.attemptNumber} installing app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+						error,
+					)
+				},
+				retries: 2,
+			}),
+		)
+
 		this.state = 'ready'
 		this.stateProgress = 0
 
@@ -210,7 +245,7 @@ export default class App {
 		await appScript(this.#umbreld, 'pre-patch-update', this.id)
 		await this.patchComposeFile()
 		await this.pull()
-		await appScript(this.#umbreld, 'post-patch-update', this.id)
+		await reportDockerPortError(() => appScript(this.#umbreld, 'post-patch-update', this.id))
 
 		// Delete the old images if we can. Silently fail on error cos docker
 		// will return an error even if only one image is still needed.
@@ -230,18 +265,23 @@ export default class App {
 	async start() {
 		this.logger.log(`Starting app ${this.id}`)
 		this.state = 'starting'
+
 		// We re-run the patch here to fix an edge case where 0.5.x imported apps
 		// wont run because they haven't been patched.
 		await this.patchComposeFile()
-		await pRetry(() => appScript(this.#umbreld, 'start', this.id), {
-			onFailedAttempt: (error) => {
-				this.logger.error(
-					`Attempt ${error.attemptNumber} starting app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
-					error,
-				)
-			},
-			retries: 2,
-		})
+
+		await reportDockerPortError(() =>
+			pRetry(() => appScript(this.#umbreld, 'start', this.id), {
+				onFailedAttempt: (error) => {
+					this.logger.error(
+						`Attempt ${error.attemptNumber} starting app ${this.id} failed. There are ${error.retriesLeft} retries left.`,
+						error,
+					)
+				},
+				retries: 2,
+			}),
+		)
+
 		this.state = 'ready'
 
 		// Enable auto-start on boot
@@ -274,7 +314,7 @@ export default class App {
 	async restart() {
 		this.state = 'restarting'
 		await appScript(this.#umbreld, 'stop', this.id)
-		await appScript(this.#umbreld, 'start', this.id)
+		await reportDockerPortError(() => appScript(this.#umbreld, 'start', this.id))
 		this.state = 'ready'
 
 		// Enable auto-start on boot
@@ -340,12 +380,13 @@ export default class App {
 					}
 				}),
 			)
+
 			return outputs
 				.join('\n')
-				.split('\n') // Split on newline
-				.map((line) => line.trim()) // Trim whitespace
-				.filter((line) => /^([1-9][0-9]*|0)$/.test(line)) // Keep only integers
-				.map((line) => parseInt(line, 10)) // And convert
+				.split('\n')
+				.map((line) => line.trim())
+				.filter((line) => /^([1-9][0-9]*|0)$/.test(line))
+				.map((line) => parseInt(line, 10))
 		} catch (error) {
 			this.logger.error(`Failed to get pids for app ${this.id}`, error)
 			return []
@@ -410,7 +451,7 @@ export default class App {
 			// TODO: consider adding other globbing chars like '?' (single-char wildcard) and '**' (recursive wildcard).
 			if (!/^[-a-zA-Z0-9._\/*]+$/.test(path)) {
 				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
-				continue // Skip invalid paths
+				continue
 			}
 
 			// Convert to absolute path and normalise traversals
@@ -419,7 +460,7 @@ export default class App {
 			// Ensure path doesn't escape the app's data directory
 			if (!path.startsWith(this.dataDirectory)) {
 				this.logger.error(`Invalid backupIgnore path ${path} for app ${this.id}, skipping`)
-				continue // Skip paths that escape the app's data directory
+				continue
 			}
 
 			// Save the sanitised path
