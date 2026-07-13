@@ -58,9 +58,14 @@ async function cleanShutdown(signal: string) {
 	if (isShuttingDown) return
 	isShuttingDown = true
 
-	umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
-	await umbreld.stop()
-	process.exit(130)
+	try {
+		umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
+		await umbreld.stop()
+	} catch (error) {
+		umbreld.logger.error('Failed to shut down Umbrel cleanly', error)
+	} finally {
+		process.exit(130)
+	}
 }
 process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
 process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
