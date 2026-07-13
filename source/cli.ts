@@ -94,7 +94,7 @@ async function doReboot() {
 		])
 
 		// Start backups last because it depends on files
-		umbreld.backups.start()
+		await umbreld.backups.start()
 		setSystemStatus('running')
 	} catch (error) {
 		umbreld.logger.error('Failed to restart Umbrel services', error)
