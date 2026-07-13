@@ -96,6 +96,8 @@ detectContainerName() {
     error "Failed to find a container with name $name!" && exit 16
   fi
 
+  export UMBREL_CONTAINER_NAME="$name"
+
   return 0
 }
 
