@@ -20,17 +20,14 @@ import {
 	getIpAddresses,
 	getNetworkInterfaces,
 	getHostname,
-	setHostname,
-	setStaticIp,
-	confirmStaticIp,
-	clearStaticIp,
-	syncDns,
 } from './system.js'
 
 import {privateProcedure, publicProcedure, publicProcedureWhenNoUserExists, router} from '../server/trpc/trpc.js'
 
 type SystemStatus = 'running' | 'updating' | 'shutting-down' | 'restarting' | 'migrating' | 'resetting' | 'restoring'
 let systemStatus: SystemStatus = 'running'
+
+const unsupportedNetworkMessage = 'Network configuration is not supported in Docker.'
 
 // Quick hack so we can set system status from migration module until we refactor this
 export function setSystemStatus(status: SystemStatus) {
@@ -82,29 +79,10 @@ export default router({
 			return ctx.umbreld.store.set('settings.releaseChannel', input.channel)
 		}),
 
-	isExternalDns: privateProcedure.query(async ({ctx}) => {
-		return await ctx.umbreld.store.get('settings.externalDns', true)
-	}),
+	isExternalDns: privateProcedure.query(() => true),
 
-	setExternalDns: privateProcedure.input(z.boolean()).mutation(async ({ctx, input}) => {
-		const previousExternalDns = await ctx.umbreld.store.get('settings.externalDns', true)
-
-		if (previousExternalDns === input) return true
-
-		await ctx.umbreld.store.set('settings.externalDns', input)
-
-		try {
-			const success = await syncDns()
-
-			if (!success) {
-				throw new Error('Failed to synchronize external DNS setting')
-			}
-
-			return true
-		} catch (error) {
-			await ctx.umbreld.store.set('settings.externalDns', previousExternalDns)
-			throw error
-		}
+	setExternalDns: privateProcedure.input(z.boolean()).mutation(async () => {
+		throw new Error(unsupportedNetworkMessage)
 	}),
 
 	update: privateProcedure.mutation(async ({ctx}) => {
@@ -116,6 +94,7 @@ export default router({
 
 			if (success) {
 				await setTimeout(1000)
+				await ctx.umbreld.stop()
 				await reboot()
 			}
 		} finally {
@@ -167,7 +146,9 @@ export default router({
 					.regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, 'Invalid hostname'),
 			}),
 		)
-		.mutation(async ({ctx, input}) => setHostname(ctx.umbreld, input.hostname)),
+		.mutation(async () => {
+			throw new Error('Changing the hostname is not supported in Docker.')
+		}),
 
 	setStaticIp: privateProcedure
 		.input(
@@ -192,7 +173,9 @@ export default router({
 					.min(1),
 			}),
 		)
-		.mutation(async ({ctx, input}) => setStaticIp(ctx.umbreld, input)),
+		.mutation(async () => {
+			throw new Error(unsupportedNetworkMessage)
+		}),
 
 	// Public so it can be called from a new origin after an IP change, where no JWT is available.
 	confirmStaticIp: publicProcedure
@@ -204,7 +187,9 @@ export default router({
 				}),
 			}),
 		)
-		.mutation(async ({input}) => confirmStaticIp(input.ip)),
+		.mutation(async () => {
+			throw new Error(unsupportedNetworkMessage)
+		}),
 
 	clearStaticIp: privateProcedure
 		.input(
@@ -212,7 +197,9 @@ export default router({
 				mac: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i, 'Invalid MAC address'),
 			}),
 		)
-		.mutation(async ({ctx, input}) => clearStaticIp(ctx.umbreld, input)),
+		.mutation(async () => {
+			throw new Error(unsupportedNetworkMessage)
+		}),
 
 	// Public during onboarding and recovery mode so users can shut down during RAID setup or mount failure
 	shutdown: publicProcedureWhenNoUserExists.mutation(async () => {
