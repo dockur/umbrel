@@ -22,6 +22,19 @@ checkEnvironment() {
   return 0
 }
 
+checkDocker() {
+
+  if ! docker info >/dev/null 2>&1; then
+    error "Failed to connect to the Docker daemon through /var/run/docker.sock." && exit 25
+  fi
+
+  if ! docker compose version >/dev/null 2>&1; then
+    error "Docker Compose is not available. Please install the Docker Compose plugin." && exit 26
+  fi
+
+  return 0
+}
+
 configureNetwork() {
 
   local current_subnet=""
@@ -273,6 +286,7 @@ prepareDirectories() {
 }
 
 checkEnvironment
+checkDocker
 
 cid=""
 name=""
