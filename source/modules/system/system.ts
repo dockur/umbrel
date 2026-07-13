@@ -157,7 +157,8 @@ function parseDockerByteSize(value: string): number {
 // Returns the memory used by every running Docker container, keyed by name.
 async function getDockerContainerMemory(umbreld: Umbreld): Promise<Map<string, number>> {
 	try {
-		const {stdout} = await $`docker stats --no-stream --format={{json .}}`
+		const format = '{{json .}}'
+		const {stdout} = await $`docker stats --no-stream --format ${format}`
 		const result = new Map<string, number>()
 
 		for (const line of stdout.trim().split('\n')) {
