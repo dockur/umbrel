@@ -379,8 +379,18 @@ export default class App {
 
 		if (!containerName) throw new Error(`No container_name found for service ${service} in app ${this.id}`)
 
-		const {stdout: containerIp} =
-			await $`docker inspect -f {{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}} ${containerName}`
+		const {stdout} = await $`docker inspect ${containerName}`
+		const container = JSON.parse(stdout)?.[0] as {
+			NetworkSettings?: {
+				Networks?: Record<string, {IPAddress?: string}>
+			}
+		}
+		const networks = container?.NetworkSettings?.Networks || {}
+		const containerIp =
+			networks.umbrel_main_network?.IPAddress ||
+			Object.values(networks).find((network) => network.IPAddress)?.IPAddress
+
+		if (!containerIp) throw new Error(`No IP address found for container ${containerName}`)
 
 		return containerIp
 	}
