@@ -49,11 +49,11 @@ export default class InternalStorage {
 	}
 
 	async start() {
-		this.logger.log('Starting internal storage')
+		this.logger.log('Internal storage is disabled in Docker')
 	}
 
 	async stop() {
-		this.logger.log('Stopping internal storage')
+		return
 	}
 
 	async getDevices(): Promise<StorageDevice[]> {
