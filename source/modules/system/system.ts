@@ -264,11 +264,8 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
 
 // Returns a list of all processes and their cpu usage
 async function getProcessesCpu() {
-	const containerName = process.env.UMBREL_CONTAINER_NAME
-	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
-
-	// In Docker we need to exec into the host PID namespace
-	const top = await $`docker exec --privileged ${containerName} top --batch-mode --iterations 1`
+	// The container shares the host PID namespace, so top can run directly.
+	const top = await $`top --batch-mode --iterations 1`
 
 	// Get lines
 	const lines = top.stdout.split('\n').map((line) => line.trim().split(/\s+/))
@@ -409,7 +406,7 @@ export async function detectDevice() {
 				deviceId = 'pi-4'
 			}
 		}
-	} catch (error) {
+	} catch {
 		// /proc/cpuinfo might not exist on some systems, do nothing.
 	}
 
@@ -459,7 +456,7 @@ export async function deleteWifiConnections({inactiveOnly = false}: {inactiveOnl
 }
 
 export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}) {
-    return false
+	return false
 }
 
 export async function restoreWiFi(umbreld: Umbreld): Promise<void> {
@@ -555,7 +552,7 @@ export async function clearStaticIp(umbreld: Umbreld, {mac}: {mac: string}) {
 
 // Restore static IP settings from store on startup
 export async function restoreStaticIp(umbreld: Umbreld): Promise<void> {
-    return
+	return
 }
 
 const syncDnsQueue = new PQueue({concurrency: 1})
