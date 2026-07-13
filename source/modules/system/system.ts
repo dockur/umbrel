@@ -358,7 +358,7 @@ export async function shutdown(): Promise<boolean> {
 
 	void (async () => {
 		await setTimeout(250)
-		await $({reject: false})`docker stop --time 100 ${containerName}`
+		await $({reject: false})`docker stop --time 50 ${containerName}`
 	})()
 
 	return true
