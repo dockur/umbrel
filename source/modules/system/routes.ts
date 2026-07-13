@@ -113,7 +113,7 @@ export default router({
 	cpuTemperature: privateProcedure.query(() => getCpuTemperature()),
 	systemDiskUsage: privateProcedure.query(({ctx}) => getSystemDiskUsage(ctx.umbreld)),
 	diskUsage: privateProcedure.query(({ctx}) => getDiskUsage(ctx.umbreld)),
-	systemMemoryUsage: privateProcedure.query(({ctx}) => getSystemMemoryUsage()),
+	systemMemoryUsage: privateProcedure.query(() => getSystemMemoryUsage()),
 	memoryUsage: privateProcedure.query(({ctx}) => getMemoryUsage(ctx.umbreld)),
 	cpuUsage: privateProcedure.query(({ctx}) => getCpuUsage(ctx.umbreld)),
 	getIpAddresses: privateProcedure.query(() => getIpAddresses()),
@@ -157,9 +157,8 @@ export default router({
 		)
 		.mutation(async ({ctx, input}) => clearStaticIp(ctx.umbreld, input)),
 	// Public during onboarding and recovery mode so users can shut down during RAID setup or mount failure
-	shutdown: publicProcedureWhenNoUserExists.mutation(async ({ctx}) => {
+	shutdown: publicProcedureWhenNoUserExists.mutation(async () => {
 		systemStatus = 'shutting-down'
-		await ctx.umbreld.stop()
 		await shutdown()
 
 		return true
