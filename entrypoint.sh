@@ -111,6 +111,51 @@ inspectContainer() {
   return 0
 }
 
+imageRepository() {
+
+  local image="${1%%@*}"
+
+  # Remove the tag from the final path component while preserving a registry port
+  sed -E 's#:[^/:]+$##' <<<"$image"
+
+  return 0
+}
+
+checkOtherInstance() {
+
+  local container=""
+  local container_image=""
+  local container_name=""
+  local container_repo=""
+  local current_image=""
+  local current_repo=""
+  local other=""
+
+  current_image=$(jq -r '.[0].Config.Image // ""' <<<"$resp")
+  current_repo=$(imageRepository "$current_image")
+
+  while read -r container; do
+    [ -z "$container" ] && continue
+
+    container_name=$(docker inspect -f '{{.Name}}' "$container" 2>/dev/null | sed 's#^/##') || continue
+    [ "$container_name" = "$name" ] && continue
+
+    container_image=$(docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null) || continue
+    container_repo=$(imageRepository "$container_image")
+
+    if [ -n "$current_repo" ] && [ "$container_repo" = "$current_repo" ]; then
+      other="$container_name"
+      break
+    fi
+  done < <(docker ps -q)
+
+  if [ -n "$other" ]; then
+    error "Another Umbrel container is already running: $other" && exit 23
+  fi
+
+  return 0
+}
+
 connectNetwork() {
 
   local network
@@ -222,9 +267,10 @@ host=$(hostname -s)
 net="umbrel_main_network"
 subnet="10.21.0.0/16"
 
-configureNetwork
 detectContainerName
 inspectContainer
+checkOtherInstance
+configureNetwork
 connectNetwork
 detectDataMount
 checkDataPermissions
