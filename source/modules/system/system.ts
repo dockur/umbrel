@@ -346,13 +346,13 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
 // umbreld gets killed.
 
 export async function shutdown(): Promise<boolean> {
-	await $`pkill -f umbreld`
+	process.kill(process.pid, 'SIGTERM')
 
 	return true
 }
 
 export async function reboot(): Promise<boolean> {
-	await $`pkill -USR1 -f umbreld`
+	process.kill(process.pid, 'SIGUSR1')
 
 	return true
 }
