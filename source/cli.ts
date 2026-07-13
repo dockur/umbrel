@@ -67,44 +67,36 @@ process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
 
 let isRebooting = false
 async function doReboot() {
-    if (isRebooting || isShuttingDown) return
-    isRebooting = true
+	if (isRebooting || isShuttingDown) return
+	isRebooting = true
 
-    try {
-        umbreld.logger.log('Restarting Umbrel services...')
+	try {
+		umbreld.logger.log(`Restarting Umbrel services...`)
 
-        await umbreld.backups.stop()
+		const stopped = await umbreld.stop()
+		if (!stopped) throw new Error('Failed to stop Umbrel services')
 
-        await Promise.all([
-            umbreld.user.stop(),
-            umbreld.files.stop(),
-            umbreld.hardware.stop(),
-            umbreld.apps.stop(),
-            umbreld.appStore.stop(),
-            umbreld.dbus.stop(),
-            umbreld.systemNg.stop(),
-        ])
+		await Promise.all([
+			umbreld.user.start(),
+			umbreld.files.start(),
+			umbreld.hardware.start(),
+			umbreld.apps.start(),
+			umbreld.appStore.start(),
+			umbreld.dbus.start(),
+			umbreld.systemNg.start(),
+		])
 
-        await Promise.all([
-            umbreld.user.start(),
-            umbreld.files.start(),
-            umbreld.hardware.start(),
-            umbreld.apps.start(),
-            umbreld.appStore.start(),
-            umbreld.dbus.start(),
-            umbreld.systemNg.start(),
-        ])
-
-        umbreld.backups.start()
-        setSystemStatus('running')
-    } catch (error) {
-        umbreld.logger.error('Failed to restart Umbrel services', error)
-        setSystemStatus('running')
-    } finally {
-        isRebooting = false
-    }
+		// Start backups last because it depends on files
+		umbreld.backups.start()
+		setSystemStatus('running')
+	} catch (error) {
+		umbreld.logger.error('Failed to restart Umbrel services', error)
+		setSystemStatus('running')
+	} finally {
+		isRebooting = false
+	}
 }
-process.on('SIGUSR1', doReboot.bind(null, 'SIGUSR1'))
+process.on('SIGUSR1', doReboot)
 
 try {
 	await umbreld.start()
