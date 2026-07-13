@@ -138,6 +138,29 @@ detectDataMount() {
   return 0
 }
 
+checkDataPermissions() {
+
+  local test_file="/data/.umbrel-write-test.$$"
+
+  # Verify that the main Umbrel process can write to the data folder
+  if ! (umask 077 && : > "$test_file") 2>/dev/null; then
+    error "The /data folder is not writable!" && exit 22
+  fi
+
+  rm -f "$test_file"
+
+  # Warn when the default Umbrel user cannot write to the data folder
+  if ! sudo -u umbrel -- sh -c '
+    umask 077
+    : > "$1"
+    rm -f "$1"
+  ' sh "$test_file" 2>/dev/null; then
+    warn "The /data folder is not writable by user umbrel (UID 1000). Some apps may have permission issues."
+  fi
+
+  return 0
+}
+
 normalizeMountPath() {
 
   # Convert Windows paths to Linux path
@@ -202,6 +225,7 @@ detectContainerName
 inspectContainer
 connectNetwork
 detectDataMount
+checkDataPermissions
 normalizeMountPath
 mirrorDataMount
 prepareDirectories
