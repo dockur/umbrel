@@ -155,7 +155,7 @@ function parseDockerByteSize(value: string): number {
 }
 
 // Returns the memory used by every running Docker container, keyed by name.
-async function getDockerContainerMemory(): Promise<Map<string, number>> {
+async function getDockerContainerMemory(umbreld: Umbreld): Promise<Map<string, number>> {
 	try {
 		const {stdout} = await $`docker stats --no-stream --format={{json .}}`
 		const result = new Map<string, number>()
@@ -163,15 +163,20 @@ async function getDockerContainerMemory(): Promise<Map<string, number>> {
 		for (const line of stdout.trim().split('\n')) {
 			if (!line) continue
 
-			const stats = JSON.parse(line) as {Name?: string; MemUsage?: string}
-			const name = stats.Name ?? ''
-			const memoryUsage = stats.MemUsage?.split('/')[0]?.trim() ?? ''
+			try {
+				const stats = JSON.parse(line) as {Name?: string; MemUsage?: string}
+				const name = stats.Name ?? ''
+				const memoryUsage = stats.MemUsage?.split('/')[0]?.trim() ?? ''
 
-			if (name) result.set(name, parseDockerByteSize(memoryUsage))
+				if (name) result.set(name, parseDockerByteSize(memoryUsage))
+			} catch (error) {
+				umbreld.logger.error('Failed to parse Docker memory statistics', error)
+			}
 		}
 
 		return result
-	} catch {
+	} catch (error) {
+		umbreld.logger.error('Failed to read Docker memory statistics', error)
 		return new Map()
 	}
 }
@@ -223,7 +228,7 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
 }> {
 	// Read meminfo first so the measurement is not affected by Docker.
 	const {size, totalUsed} = await getSystemMemoryFromMeminfo()
-	const containerMemory = await getDockerContainerMemory()
+	const containerMemory = await getDockerContainerMemory(umbreld)
 
 	const apps = await Promise.all(
 		umbreld.apps.instances.map(async (app) => {
