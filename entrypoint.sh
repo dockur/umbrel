@@ -28,7 +28,11 @@ configureNetwork() {
   local network_json=""
 
   if network_json=$(docker network inspect "$net" 2>/dev/null); then
-    current_subnet="$(jq -r '.[0].IPAM.Config[0].Subnet // ""' <<<"$network_json")"
+    if jq -e --arg subnet "$subnet" 'any(.[0].IPAM.Config[]?; .Subnet == $subnet)' <<<"$network_json" >/dev/null; then
+      current_subnet="$subnet"
+    else
+      current_subnet="$(jq -r '.[0].IPAM.Config[0].Subnet // ""' <<<"$network_json")"
+    fi
   fi
 
   if [ -n "$current_subnet" ] && [ "$current_subnet" != "$subnet" ]; then
