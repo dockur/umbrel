@@ -275,22 +275,27 @@ async function getProcessesCpu() {
 
 	// Find header and CPU column
 	const headerIndex = lines.findIndex((line) => line[0] === 'PID')
+	if (headerIndex === -1) {
+		throw new Error('Unable to locate process header in top output')
+	}
+
 	const cpuIndex = lines[headerIndex].findIndex((column) => column === '%CPU')
+	if (cpuIndex === -1) {
+		throw new Error('Unable to locate CPU column in top output')
+	}
 
 	// Get CPU threads
 	const threads = os.cpus().length
 
 	// Ignore lines before the header
-	const processes = lines.slice(headerIndex + 1).map((line) => {
-		// Parse values
-		return {
+	return lines
+		.slice(headerIndex + 1)
+		.map((line) => ({
 			pid: parseInt(line[0], 10),
-			// Convert to % of total system not % of a single thread
+			// Convert to % of total system, not % of a single thread
 			cpu: parseFloat(line[cpuIndex]) / threads,
-		}
-	})
-
-	return processes
+		}))
+		.filter((process) => Number.isFinite(process.pid) && Number.isFinite(process.cpu))
 }
 
 type CpuUsage = {
