@@ -1,12 +1,11 @@
 import os from 'node:os'
-import {setTimeout} from 'node:timers/promises'
 
 import {z} from 'zod'
 import {$} from 'execa'
 import fse from 'fs-extra'
 import stripAnsi from 'strip-ansi'
 
-import {getUpdateStatus, performUpdate, getLatestRelease} from './update.js'
+import {getUpdateStatus, performUpdate} from './update.js'
 import {
 	getCpuTemperature,
 	getSystemDiskUsage,
@@ -28,6 +27,7 @@ type SystemStatus = 'running' | 'updating' | 'shutting-down' | 'restarting' | 'm
 let systemStatus: SystemStatus = 'running'
 
 const unsupportedNetworkMessage = 'Network configuration is not supported in Docker.'
+const unsupportedUpdateMessage = 'Updates are not supported in Docker. Update the Docker image instead.'
 
 // Quick hack so we can set system status from migration module until we refactor this
 export function setSystemStatus(status: SystemStatus) {
@@ -51,23 +51,17 @@ export default router({
 
 	uptime: privateProcedure.query(() => os.uptime()),
 
+	// Docker installations are updated by pulling a newer container image.
 	checkUpdate: privateProcedure.query(async ({ctx}) => {
-		const {version, name, releaseNotes} = await getLatestRelease(ctx.umbreld)
-
-		// v prefix is needed in the tag name for legacy reasons, remove it before comparing to local version
-		const available = version.replace('v', '') !== ctx.umbreld.version
-
 		return {
-			available,
-			version,
-			name,
-			releaseNotes,
+			available: false,
+			version: ctx.umbreld.version,
+			name: ctx.umbreld.versionName,
+			releaseNotes: '',
 		}
 	}),
 
-	getReleaseChannel: privateProcedure.query(async ({ctx}) => {
-		return (await ctx.umbreld.store.get('settings.releaseChannel')) || 'stable'
-	}),
+	getReleaseChannel: privateProcedure.query(() => 'stable'),
 
 	setReleaseChannel: privateProcedure
 		.input(
@@ -75,8 +69,8 @@ export default router({
 				channel: z.enum(['stable', 'beta']),
 			}),
 		)
-		.mutation(async ({ctx, input}) => {
-			return ctx.umbreld.store.set('settings.releaseChannel', input.channel)
+		.mutation(async () => {
+			throw new Error(unsupportedUpdateMessage)
 		}),
 
 	isExternalDns: privateProcedure.query(() => true),
@@ -91,12 +85,6 @@ export default router({
 
 		try {
 			success = await performUpdate(ctx.umbreld)
-
-			if (success) {
-				await setTimeout(1000)
-				await ctx.umbreld.stop()
-				await reboot()
-			}
 		} finally {
 			if (!success) {
 				systemStatus = 'running'
