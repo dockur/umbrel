@@ -239,14 +239,20 @@ checkDataPermissions() {
 
   local test_file="/data/.umbrel-write-test.$$"
 
-  # Verify that the main Umbrel process can write to the data folder
+  # Verify that the container can write to the data folder
   if ! (umask 077 && : > "$test_file") 2>/dev/null; then
     error "The /data folder is not writable!" && exit 22
   fi
 
   rm -f "$test_file"
 
-  # Warn when the default Umbrel user cannot write to the data folder
+  # Docker creates a new bind-mounted directory as root. Assign an empty
+  # directory to Umbrel, but never change ownership of existing data.
+  if [ -z "$(find /data -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    chown umbrel:umbrel /data 2>/dev/null || :
+  fi
+
+  # Warn when the Umbrel user still cannot write to the data folder
   if ! sudo -u umbrel -- sh -c '
     umask 077
     : > "$1"
