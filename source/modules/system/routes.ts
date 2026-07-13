@@ -178,14 +178,18 @@ export default router({
 			}),
 		)
 		.query(async ({input}) => {
-			let process
-			if (input.type === 'umbrelos') {
-				process = await $`journalctl --unit umbrel --unit umbreld-production --unit umbreld --unit ui --lines 1500`
-			}
 			if (input.type === 'system') {
-				process = await $`journalctl --lines 1500`
+				return 'System logs are not available in the Docker version of Umbrel.'
 			}
-			return stripAnsi(process!.stdout)
+
+			const containerName = process.env.UMBREL_CONTAINER_NAME
+
+			if (!containerName) {
+				throw new Error('Failed to determine the Umbrel container name.')
+			}
+
+			const logs = await $`docker logs --tail 1500 ${containerName}`
+			return stripAnsi(`${logs.stdout}\n${logs.stderr}`.trim())
 		}),
 	//
 	// Public during onboarding and recovery mode - password required unless in recovery mode
