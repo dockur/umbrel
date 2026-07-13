@@ -79,7 +79,9 @@ async function doReboot() {
 		umbreld.logger.log(`Restarting Umbrel services...`)
 
 		const stopped = await umbreld.stop()
-		if (!stopped) throw new Error('Failed to stop Umbrel services')
+		if (!stopped) {
+			umbreld.logger.error('One or more Umbrel services failed to stop cleanly')
+		}
 
 		await Promise.all([
 			umbreld.user.start(),
