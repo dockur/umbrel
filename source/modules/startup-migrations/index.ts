@@ -21,22 +21,6 @@ class Migration {
 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
 	}
 
-	async activateImportedDataDirectory() {
-		const importData = `${this.umbreld.dataDirectory}/import`
-		const importDataExists = await fse.exists(importData)
-		if (!importDataExists) return
-		this.logger.log('Found Umbrel data to import, activating...')
-		// We have to move the import dir parrallel to the data dir and then overwrte.
-		// This is because fse.move doesn't work if the source is a subdirectory of the destination.
-		// This is fine to do on Umbrel Home because all of /home is on the large data partition.
-		// On Rasperry Pi the data partition is small on the SD card and only the data dir on the
-		// large external USB storage. We don't currently support data import on Pi so it's ok for now
-		// but we'll need to handle this if we want to support it in the future.
-		const temporaryData = `${this.umbreld.dataDirectory}-import-temp`
-		await fse.move(importData, temporaryData, {overwrite: true})
-		await fse.move(temporaryData, this.umbreld.dataDirectory, {overwrite: true})
-	}
-
 	async migrateBackThatMacUpPort() {
 		// Check if the Back That Mac Up app is installed
 		const isBackThatMacUpInstalled = ((await this.umbreld.store.get('apps')) || []).includes('back-that-mac-up')
@@ -86,13 +70,6 @@ class Migration {
 		// } catch (error) {
 		// 	this.logger.error(`Failed to finalize Mender to Rugix state migration`, error)
 		//}
-
-		// Check for a data directory to import
-		try {
-			await this.activateImportedDataDirectory()
-		} catch (error) {
-			this.logger.error(`Failed to activate imported Umbrel data`, error)
-		}
 
 		// Check for a legacy <1.0 Umbrel data directory and migrate to 1.0 format if found
 		//try {
