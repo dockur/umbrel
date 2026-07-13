@@ -66,15 +66,43 @@ process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
 process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
 
 let isRebooting = false
-async function doReboot(signal: string) {
-	if (isRebooting) return
-	isRebooting = true
+async function doReboot() {
+    if (isRebooting || isShuttingDown) return
+    isRebooting = true
 
-	umbreld.logger.log(`Rebooting...`)
-	await Promise.all([umbreld.apps.stop(), umbreld.appStore.stop()])
-	await Promise.all([umbreld.apps.start(), umbreld.appStore.start()])
-	setSystemStatus('running')
-	isRebooting = false
+    try {
+        umbreld.logger.log('Restarting Umbrel services...')
+
+        await umbreld.backups.stop()
+
+        await Promise.all([
+            umbreld.user.stop(),
+            umbreld.files.stop(),
+            umbreld.hardware.stop(),
+            umbreld.apps.stop(),
+            umbreld.appStore.stop(),
+            umbreld.dbus.stop(),
+            umbreld.systemNg.stop(),
+        ])
+
+        await Promise.all([
+            umbreld.user.start(),
+            umbreld.files.start(),
+            umbreld.hardware.start(),
+            umbreld.apps.start(),
+            umbreld.appStore.start(),
+            umbreld.dbus.start(),
+            umbreld.systemNg.start(),
+        ])
+
+        umbreld.backups.start()
+        setSystemStatus('running')
+    } catch (error) {
+        umbreld.logger.error('Failed to restart Umbrel services', error)
+        setSystemStatus('running')
+    } finally {
+        isRebooting = false
+    }
 }
 process.on('SIGUSR1', doReboot.bind(null, 'SIGUSR1'))
 
