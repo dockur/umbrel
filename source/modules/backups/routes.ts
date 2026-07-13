@@ -2,6 +2,9 @@ import z from 'zod'
 
 import {router, privateProcedure, publicProcedureWhenNoUserExists} from '../server/trpc/trpc.js'
 
+const unsupportedRepositoryMessage =
+	'Creating backup repositories is not supported in Docker. Configure a supported backup destination outside Umbrel.'
+
 export default router({
 	// Get all backup repositories
 	getRepositories: privateProcedure.query(async ({ctx}) => {
@@ -16,10 +19,12 @@ export default router({
 		.input(z.object({repositoryId: z.string()}))
 		.query(async ({ctx, input}) => ctx.umbreld.backups.getRepositorySize(input.repositoryId)),
 
-	// Create a new backup repository
+	// Creating backup repositories is unavailable because Docker storage destinations are managed externally
 	createRepository: privateProcedure
 		.input(z.object({path: z.string(), password: z.string()}))
-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.createRepository(input.path, input.password)),
+		.mutation(async () => {
+			throw new Error(unsupportedRepositoryMessage)
+		}),
 
 	// Forget a repository
 	forgetRepository: privateProcedure
@@ -80,10 +85,12 @@ export default router({
 		.input(z.object({path: z.string()}))
 		.mutation(async ({ctx, input}) => ctx.umbreld.backups.removeIgnoredPath(input.path)),
 
-	// Connect to an existing repository
+	// Connecting backup repositories is unavailable because Docker storage destinations are managed externally
 	connectToExistingRepository: publicProcedureWhenNoUserExists
 		.input(z.object({path: z.string(), password: z.string()}))
-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.connectToExistingRepository(input.path, input.password)),
+		.mutation(async () => {
+			throw new Error(unsupportedRepositoryMessage)
+		}),
 
 	// Mount-dependent backup restoration is unavailable in Docker
 	restoreBackup: publicProcedureWhenNoUserExists
