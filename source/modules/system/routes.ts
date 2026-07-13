@@ -116,7 +116,6 @@ export default router({
 
 			if (success) {
 				await setTimeout(1000)
-				await ctx.umbreld.stop()
 				await reboot()
 			}
 		} finally {
