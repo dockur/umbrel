@@ -39,8 +39,12 @@ export default class Apps {
 			const containers = JSON.parse((await $`docker inspect ${containerIds}`).stdout)
 			const dataDirectory = this.#umbreld.dataDirectory
 			const appDataDirectory = `${dataDirectory}/app-data/`
+			const outerContainerName = process.env.UMBREL_CONTAINER_NAME
 			const ownedContainerIds = containers
 				.filter((container: any) => {
+					const containerName = String(container?.Name ?? '').replace(/^\//, '')
+					if (outerContainerName && containerName === outerContainerName) return false
+
 					const labels = container?.Config?.Labels ?? {}
 					const workingDirectory = labels['com.docker.compose.project.working_dir'] ?? ''
 					const configFiles = labels['com.docker.compose.project.config_files'] ?? ''
