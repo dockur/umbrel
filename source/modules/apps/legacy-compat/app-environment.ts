@@ -11,6 +11,9 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 	// Prevent breaking test output
 	if (process.env.TEST === 'true') inheritStdio = false
 
+	const containerName = process.env.UMBREL_CONTAINER_NAME
+	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
+
 	const currentFilename = fileURLToPath(import.meta.url)
 	const currentDirname = dirname(currentFilename)
 	const composePath = join(currentDirname, 'docker-compose.yml')
@@ -33,15 +36,18 @@ export default async function appEnvironment(umbreld: Umbreld, command: string) 
 			TOR_HASHED_PASSWORD: '16:158FBE422B1A9D996073BE2B9EC38852C70CE12362CA016F8F6859C426',
 			UMBREL_AUTH_SECRET: 'DEADBEEF', // Not used, just left in for compatibility reasons
 			JWT_SECRET: await umbreld.server.getJwtSecret(),
-			UMBRELD_RPC_HOST: `host.docker.internal:${umbreld.server.port}`, // TODO: Check host.docker.internal works on linux
+			UMBRELD_RPC_HOST: `${containerName}:${umbreld.server.port}`,
 			UMBREL_LEGACY_COMPAT_DIR: currentDirname,
-			UMBREL_TORRC: torEnabled ? `${umbreld.dataDirectory}/tor/tor-server-torrc` : `${umbreld.dataDirectory}/tor/tor-proxy-torrc`,
+			UMBREL_TORRC: torEnabled
+				? `${umbreld.dataDirectory}/tor/tor-server-torrc`
+				: `${umbreld.dataDirectory}/tor/tor-proxy-torrc`,
 		},
 	}
+
 	if (command === 'up') {
 		// Docker: Copy torrc files to data directory so they're accessible to tor containers
-                await fse.copy(`${currentDirname}/tor-proxy-torrc`, `${umbreld.dataDirectory}/tor/tor-proxy-torrc`)
-                await fse.copy(`${currentDirname}/tor-server-torrc`, `${umbreld.dataDirectory}/tor/tor-server-torrc`)
+		await fse.copy(`${currentDirname}/tor-proxy-torrc`, `${umbreld.dataDirectory}/tor/tor-proxy-torrc`)
+		await fse.copy(`${currentDirname}/tor-server-torrc`, `${umbreld.dataDirectory}/tor/tor-server-torrc`)
 		await $(
 			options as any,
 		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
