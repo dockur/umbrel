@@ -148,6 +148,48 @@ index bdaa66bb..17f8d098 100644
  
  		return containerIp
  	}
+diff --git a/packages/umbreld/source/modules/apps/apps-image-cleanup.unit.test.ts b/packages/umbreld/source/modules/apps/apps-image-cleanup.unit.test.ts
+index 301427c7..d0bd7d74 100644
+--- a/packages/umbreld/source/modules/apps/apps-image-cleanup.unit.test.ts
++++ b/packages/umbreld/source/modules/apps/apps-image-cleanup.unit.test.ts
+@@ -13,7 +13,7 @@ vi.mock('./app.js', async (original) => ({
+ vi.mock('./legacy-compat/app-environment.js', () => ({default: vi.fn()}))
+ vi.mock('./image-cleanup.js', async (original) => ({
+ 	...(await original<typeof import('./image-cleanup.js')>()),
+-	removeUnusedImages: vi.fn(async () => {}),
++	removeUnusedImages: vi.fn(async () => new Set(['kept'])),
+ }))
+ 
+ beforeEach(() => {
+@@ -28,7 +28,11 @@ function fixture() {
+ 		version: '2.0.0',
+ 		dataDirectory: '/unused-image-cleanup-test',
+ 		logger: {createChildLogger: () => logger},
+-		store: {get: async () => ['stopped', 'updating']},
++		// Docker: the store also tracks the image IDs umbrelOS manages
++		store: {
++			get: async (key: string) => (key === 'managedDockerImages' ? ['managed'] : ['stopped', 'updating']),
++			set: vi.fn(async () => true),
++		},
+ 		appStore: {getAppTemplateFilePath: async () => '/unused-app-template'},
+ 	} as unknown as Umbreld)
+ 	const stopped = {id: 'stopped', state: 'stopped', getExpectedImages: vi.fn(async () => ['stopped:pinned'])}
+@@ -50,6 +54,7 @@ describe('app image cleanup requests', () => {
+ 		expect(removeUnusedImages).toHaveBeenCalledWith(
+ 			['system:current', 'stopped:pinned', 'updating:current'],
+ 			apps.logger,
++			new Set(['managed']),
+ 		)
+ 	})
+ 
+@@ -64,6 +69,7 @@ describe('app image cleanup requests', () => {
+ 		expect(removeUnusedImages).toHaveBeenCalledWith(
+ 			['system:current', 'stopped:pinned', 'updating:partially-updated'],
+ 			apps.logger,
++			new Set(['managed']),
+ 		)
+ 	})
+ 
 diff --git a/packages/umbreld/source/modules/apps/apps.ts b/packages/umbreld/source/modules/apps/apps.ts
 index 6e190c1c..dddc3437 100644
 --- a/packages/umbreld/source/modules/apps/apps.ts
@@ -284,6 +326,72 @@ index fbe45da0..33514e10 100644
 +
 +	return nextManagedIds
  }
+diff --git a/packages/umbreld/source/modules/apps/image-cleanup.unit.test.ts b/packages/umbreld/source/modules/apps/image-cleanup.unit.test.ts
+index 7a4d5f66..57bc18de 100644
+--- a/packages/umbreld/source/modules/apps/image-cleanup.unit.test.ts
++++ b/packages/umbreld/source/modules/apps/image-cleanup.unit.test.ts
+@@ -190,23 +190,18 @@ function dockerFixture() {
+ }
+ 
+ describe('unused images', () => {
+-	test('keeps expected IDs and all container images, and removes tagged, digest-only and dangling leftovers', async () => {
++	test('keeps expected IDs, container images and unmanaged images, and removes managed tagged, digest-only and dangling leftovers', async () => {
+ 		const {docker, remove} = dockerFixture()
+-		await removeUnusedImages(
++		const managed = new Set(['shared', 'tor', 'running', 'stopped', 'old', 'dangling'])
++		const nextManaged = await removeUnusedImages(
+ 			['app@sha256:current', 'alias:latest', 'tor@sha256:current', 'not-downloaded'],
+ 			logger(),
++			managed,
+ 			docker,
+ 		)
+ 		const removed = remove.mock.calls.map(([reference]) => reference)
+-		expect(removed).toEqual([
+-			'old:one',
+-			'old:two',
+-			'old@sha256:old',
+-			'old',
+-			'dangling',
+-			'manually-pulled:latest',
+-			'manual',
+-		])
++		expect(removed).toEqual(['old:one', 'old:two', 'old@sha256:old', 'old', 'dangling'])
++		expect([...nextManaged].sort()).toEqual(['running', 'shared', 'stopped', 'tor'])
+ 		for (const [, options] of remove.mock.calls) expect(options).toEqual({force: false, noprune: true})
+ 		expect(docker.listImages).toHaveBeenCalledWith({all: true})
+ 		expect(docker.listContainers).toHaveBeenCalledOnce()
+@@ -216,14 +211,16 @@ describe('unused images', () => {
+ 	test('aborts before any deletion when an expected image cannot be inspected reliably', async () => {
+ 		const {docker, inspect, remove} = dockerFixture()
+ 		inspect.mockRejectedValueOnce(new Error('Docker connection lost'))
+-		await expect(removeUnusedImages(['app:current'], logger(), docker)).rejects.toThrow('Docker connection lost')
++		await expect(removeUnusedImages(['app:current'], logger(), new Set(['old']), docker)).rejects.toThrow(
++			'Docker connection lost',
++		)
+ 		expect(remove).not.toHaveBeenCalled()
+ 	})
+ 
+ 	test('aborts before deletion when containers cannot be listed', async () => {
+ 		const {docker, listContainers, remove} = dockerFixture()
+ 		listContainers.mockRejectedValueOnce(new Error('Docker connection lost'))
+-		await expect(removeUnusedImages([], logger(), docker)).rejects.toThrow('Docker connection lost')
++		await expect(removeUnusedImages([], logger(), new Set(['old']), docker)).rejects.toThrow('Docker connection lost')
+ 		expect(remove).not.toHaveBeenCalled()
+ 	})
+ 
+@@ -232,9 +229,11 @@ describe('unused images', () => {
+ 		const log = logger()
+ 		const conflict = Object.assign(new Error('image is in use'), {statusCode: 409})
+ 		remove.mockRejectedValueOnce(conflict)
+-		await removeUnusedImages(['shared', 'tor'], log, docker)
++		const nextManaged = await removeUnusedImages(['shared', 'tor'], log, new Set(['old', 'dangling']), docker)
+ 		expect(log.error).toHaveBeenCalledWith('Could not remove unused Docker image old', conflict)
+ 		expect(remove).toHaveBeenCalledWith('dangling', {force: false, noprune: true})
+ 		expect(remove.mock.calls.map(([reference]) => reference)).not.toContain('old:two')
++		// A failed removal stays managed so the next sweep retries it
++		expect(nextManaged.has('old')).toBe(true)
+ 	})
+ })
 diff --git a/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts b/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts
 index e1ca75b6..4e99b6fd 100644
 --- a/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts
@@ -611,8 +719,50 @@ index b1ca9ba6..9f78bb36 100644
 +		return
  	}
  }
+diff --git a/packages/umbreld/source/modules/files/app-directory-consumers.unit.test.ts b/packages/umbreld/source/modules/files/app-directory-consumers.unit.test.ts
+index 331200b3..c49663d8 100644
+--- a/packages/umbreld/source/modules/files/app-directory-consumers.unit.test.ts
++++ b/packages/umbreld/source/modules/files/app-directory-consumers.unit.test.ts
+@@ -139,7 +139,8 @@ test('app removal clears root and descendant references without removing similar
+ 	await expectReferences(paths.slice(2))
+ })
+ 
+-test('cleans up app favorites, Samba shares and member grants once every 24 hours', async () => {
++// Docker: Samba is disabled, so only favorites and member grants are cleaned up
++test('cleans up app favorites and member grants once every 24 hours', async () => {
+ 	const temporary = temporaryDirectory()
+ 	const umbreld = new Umbreld({dataDirectory: await temporary.create(), logLevel: 'silent'})
+ 	const path = '/Apps/example/shared'
+@@ -147,10 +148,7 @@ test('cleans up app favorites, Samba shares and member grants once every 24 hour
+ 	await fse.ensureDir(systemPath)
+ 	await umbreld.store.set('user', {name: 'Owner', hashedPassword: 'unused'})
+ 	await umbreld.user.updateAccountFavorites('0', () => [path])
+-	await umbreld.store.set('files.shares', [{name: 'Shared', path, userId: '0'}])
+ 	await umbreld.store.set('files.memberShares', [{path, sharedWith: 'all'}])
+-	vi.spyOn(umbreld.files.samba, 'applyCredentials').mockResolvedValue(undefined)
+-	const applyShares = vi.spyOn(umbreld.files.samba, 'applyShares').mockResolvedValue(undefined as never)
+ 	try {
+ 		vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+ 		await umbreld.files.favorites.start()
+@@ -163,16 +161,12 @@ test('cleans up app favorites, Samba shares and member grants once every 24 hour
+ 		await fse.ensureDir(systemPath)
+ 		await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000 - 1)
+ 		expect(await umbreld.user.getAccountFavorites('0')).toEqual([path])
+-		expect(await umbreld.store.get('files.shares')).toHaveLength(1)
+ 		expect(await umbreld.files.memberShares.list()).toHaveLength(1)
+-		expect(applyShares).toHaveBeenCalledOnce()
+ 		await vi.advanceTimersByTimeAsync(1)
+ 		await vi.waitFor(async () => {
+ 			expect(await umbreld.user.getAccountFavorites('0')).toEqual([])
+-			expect(await umbreld.store.get('files.shares')).toEqual([])
+ 			expect(await umbreld.files.memberShares.list()).toEqual([])
+ 		})
+-		expect(applyShares).toHaveBeenCalledTimes(2)
+ 		await expect(fse.pathExists(systemPath)).resolves.toBe(true)
+ 	} finally {
+ 		await umbreld.files.favorites.stop()
 diff --git a/packages/umbreld/source/modules/files/external-storage.ts b/packages/umbreld/source/modules/files/external-storage.ts
-index 9e31d3bc..a59d97ac 100644
+index 9e31d3bc..cb7c62ae 100644
 --- a/packages/umbreld/source/modules/files/external-storage.ts
 +++ b/packages/umbreld/source/modules/files/external-storage.ts
 @@ -58,63 +58,7 @@ export function syntheticOwnershipMountOptions(filesystemType: string, userId: n
@@ -676,7 +826,7 @@ index 9e31d3bc..a59d97ac 100644
 -	}
 -
 -	return externalStorageDevices
-+	return [] as any[]
++	return [] as BlockDevice[]
  }
  
  export default class ExternalStorage {
@@ -937,7 +1087,7 @@ index 9e31d3bc..a59d97ac 100644
 -		}
 -
 -		return externalBlockDevices
-+		return []
++		return [] as BlockDevice[]
  	}
  
  	// Get all umbreld mounted external devices
@@ -955,12 +1105,12 @@ index 9e31d3bc..a59d97ac 100644
 -		const mountedExternalDevices = externalBlockDevices.filter((device) => device.partitions.length > 0)
 -
 -		return mountedExternalDevices
-+		return []
++		return [] as BlockDevice[]
  	}
  
  	// Unmount all mounted external devices
 diff --git a/packages/umbreld/source/modules/files/network-storage.ts b/packages/umbreld/source/modules/files/network-storage.ts
-index 2dee62a1..85b0b7f6 100644
+index 2dee62a1..a76fca95 100644
 --- a/packages/umbreld/source/modules/files/network-storage.ts
 +++ b/packages/umbreld/source/modules/files/network-storage.ts
 @@ -34,53 +34,21 @@ export default class NetworkStorage {
@@ -1005,7 +1155,7 @@ index 2dee62a1..85b0b7f6 100644
  	// List all shares from the store
  	async getShares() {
 -		return (await this.#umbreld.store.get('files.networkStorage')) || []
-+		return [] as Array<{host: string; share: string; username: string; password: string; mountPath: string}>
++		return [] as NetworkShare[]
  	}
  
  	// List all shares including mount status
@@ -1017,7 +1167,7 @@ index 2dee62a1..85b0b7f6 100644
 -			mountPath,
 -			isMounted: this.mountedShares.has(mountPath),
 -		}))
-+		return []
++		return [] as {host: string; share: string; mountPath: string; isMounted: boolean}[]
  	}
  
  	// Constantly check if shares are mounted and if not, mount them
@@ -1102,7 +1252,7 @@ index 2dee62a1..85b0b7f6 100644
 -
 -		// Only return each address once
 -		return Array.from(new Set(servers))
-+		return []
++		return [] as string[]
  	}
  
  	// Discover shares for a given samba server
@@ -1140,6 +1290,56 @@ index 2dee62a1..85b0b7f6 100644
 +		return false
  	}
  }
+diff --git a/packages/umbreld/source/modules/files/network-storage.unit.test.ts b/packages/umbreld/source/modules/files/network-storage.unit.test.ts
+index 52055282..a3f9ab76 100644
+--- a/packages/umbreld/source/modules/files/network-storage.unit.test.ts
++++ b/packages/umbreld/source/modules/files/network-storage.unit.test.ts
+@@ -19,7 +19,26 @@ beforeEach(() => {
+ 	runCommand.mockReset()
+ })
+ 
+-test('keeps a configured network share when unmounting fails', async () => {
++// Docker: network storage is disabled, so the umbrelOS mount tests below are
++// skipped and replaced by this one.
++test('reports no shares and refuses to manage them in Docker', async () => {
++	const logger = {log: vi.fn(), error: vi.fn(), verbose: vi.fn()}
++	const storage = new NetworkStorage({logger: {createChildLogger: () => logger}} as unknown as Umbreld)
++
++	await storage.start()
++	expect(await storage.getShares()).toEqual([])
++	expect(await storage.getShareInfo()).toEqual([])
++	expect(await storage.discoverServers()).toEqual([])
++	await expect(
++		storage.addShare({host: 'nas.local', share: 'Media', username: 'ada', password: 'secret'}),
++	).rejects.toThrow('Network storage is not supported in Docker.')
++	await expect(storage.removeShare('/Network/nas.local/Media')).rejects.toThrow(
++		'Network storage is not supported in Docker.',
++	)
++	expect(runCommand).not.toHaveBeenCalled()
++})
++
++test.skip('keeps a configured network share when unmounting fails', async () => {
+ 	const share = {
+ 		host: 'nas.local',
+ 		share: 'Media',
+@@ -78,7 +97,7 @@ test('keeps a configured network share when unmounting fails', async () => {
+ 	expect(releaseApps).toHaveBeenCalledOnce()
+ })
+ 
+-test('removes an unmounted configured share when its mount directory is already absent', async () => {
++test.skip('removes an unmounted configured share when its mount directory is already absent', async () => {
+ 	const share = {
+ 		host: 'offline-nas.local',
+ 		share: 'Archive',
+@@ -132,7 +151,7 @@ test('removes an unmounted configured share when its mount directory is already
+ 	expect(logger.error).not.toHaveBeenCalled()
+ })
+ 
+-test('unmounts every stacked filesystem before removing a configured share', async () => {
++test.skip('unmounts every stacked filesystem before removing a configured share', async () => {
+ 	const share = {
+ 		host: 'nas.local',
+ 		share: 'Media',
 diff --git a/packages/umbreld/source/modules/files/samba.ts b/packages/umbreld/source/modules/files/samba.ts
 index a4ba25db..32fa3795 100644
 --- a/packages/umbreld/source/modules/files/samba.ts
@@ -1407,6 +1607,43 @@ index a4ba25db..32fa3795 100644
  	}
  
  	async removeShare(virtualPath: string, userId: string = OWNER_USER_ID) {
+diff --git a/packages/umbreld/source/modules/files/samba.unit.test.ts b/packages/umbreld/source/modules/files/samba.unit.test.ts
+index 29c6c163..bd0fb575 100644
+--- a/packages/umbreld/source/modules/files/samba.unit.test.ts
++++ b/packages/umbreld/source/modules/files/samba.unit.test.ts
+@@ -4,7 +4,9 @@ import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest'
+ import Umbreld from '../../index.js'
+ import temporaryDirectory from '../utilities/temporary-directory.js'
+ 
+-describe('multi-account Samba policy', () => {
++// Docker: Samba is disabled, so the umbrelOS sharing policy tests are skipped
++// and replaced by the test at the end of this file.
++describe.skip('multi-account Samba policy', () => {
+ 	let directory: ReturnType<typeof temporaryDirectory>
+ 	let umbreld: Umbreld
+ 
+@@ -274,3 +276,21 @@ describe('multi-account Samba policy', () => {
+ 		expect(await umbreld.store.get('files.shares')).toEqual([{name: 'Owner', path: '/Home/Documents', userId: '0'}])
+ 	})
+ })
++
++describe('Samba in Docker', () => {
++	test('refuses to share folders', async () => {
++		const directory = temporaryDirectory()
++		await directory.createRoot()
++		const umbreld = new Umbreld({dataDirectory: await directory.create(), logLevel: 'silent'})
++		try {
++			await fse.ensureDir(umbreld.files.virtualToSystemPathUnsafe('/Home/Documents'))
++			await expect(umbreld.files.samba.addShare('/Home/Documents')).rejects.toThrow(
++				'File sharing is not supported in Docker.',
++			)
++			expect(await umbreld.store.get('files.shares')).toBeUndefined()
++		} finally {
++			await umbreld.auth.stop()
++			await directory.destroyRoot()
++		}
++	})
++})
 diff --git a/packages/umbreld/source/modules/files/watcher.ts b/packages/umbreld/source/modules/files/watcher.ts
 index 5ce5c34b..9c286ebd 100644
 --- a/packages/umbreld/source/modules/files/watcher.ts
@@ -1599,7 +1836,7 @@ index b2154e9c..e4183b2d 100644
  	}
  }
 diff --git a/packages/umbreld/source/modules/hardware/raid.ts b/packages/umbreld/source/modules/hardware/raid.ts
-index b032df8f..6690b48b 100644
+index b032df8f..c7c53f7b 100644
 --- a/packages/umbreld/source/modules/hardware/raid.ts
 +++ b/packages/umbreld/source/modules/hardware/raid.ts
 @@ -521,22 +521,12 @@ export default class Raid {
@@ -1717,29 +1954,30 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #updateConfigDevicePaths(): Promise<void> {
-@@ -742,20 +656,7 @@ export default class Raid {
+@@ -742,19 +656,13 @@ export default class Raid {
  
  	// Get status of the main RAID pool with migration error if any
  	async getStatus() {
 -		const name = await this.configStore.get('raid.poolName')
 -		const status = await this.getPoolStatus(name)
 -
--		return {
++		// Docker: RAID is disabled, report a missing pool with the same shape as umbrelOS
++		const status: Awaited<ReturnType<Raid['getPoolStatus']>> = {exists: false}
+ 		return {
 -			name,
--			...status,
--			replace: this.replaceStatus,
--			failsafeTransitionStatus: this.failsafeTransitionStatus,
++			name: '',
+ 			...status,
+ 			replace: this.replaceStatus,
+ 			failsafeTransitionStatus: this.failsafeTransitionStatus,
 -			// Supress degraded state when performing failsafe transition
 -			status:
 -				this.failsafeTransitionStatus?.state === 'rebuilding' && status.status === 'DEGRADED'
 -					? 'ONLINE'
 -					: status.status,
--		}
-+		return {exists: false} as Awaited<ReturnType<Raid['getPoolStatus']>> & {migrationError?: string}
+ 		}
  	}
  
- 	// Get status of a RAID pool
-@@ -793,252 +694,7 @@ export default class Raid {
+@@ -793,252 +701,7 @@ export default class Raid {
  		rebuild?: RebuildStatus
  		scrub?: ScrubStatus
  	}> {
@@ -1993,7 +2231,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	#assertNoScrubInProgress(pool: Awaited<ReturnType<Raid['getStatus']>>, operation: string): void {
-@@ -1071,39 +727,7 @@ export default class Raid {
+@@ -1071,39 +734,7 @@ export default class Raid {
  
  	// Start a scrub and let the pool monitor report progress and completion.
  	async scrub(): Promise<boolean> {
@@ -2034,7 +2272,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #getZpoolStatus(poolName: string): Promise<Pool | undefined> {
-@@ -1123,115 +747,35 @@ export default class Raid {
+@@ -1123,115 +754,35 @@ export default class Raid {
  		acceleratorDevices: string[] | undefined,
  		user: {name: string; password: string; language: string},
  	) {
@@ -2157,7 +2395,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #getRecoverableInstall(): Promise<string | undefined> {
-@@ -1488,7 +1032,7 @@ export default class Raid {
+@@ -1488,7 +1039,7 @@ export default class Raid {
  	// 2. Create a ZFS pool from all data partitions
  	// 3. Write RAID config to boot partition to signal the boot process to mount the array
  	async setup(deviceIds: string[], raidType: RaidType, acceleratorDeviceIds?: string[]): Promise<boolean> {
@@ -2166,7 +2404,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #setup(deviceIds: string[], raidType: RaidType, acceleratorDeviceIds?: string[]): Promise<boolean> {
-@@ -1635,7 +1179,7 @@ export default class Raid {
+@@ -1635,7 +1186,7 @@ export default class Raid {
  	// Add one device to a stripe (storage) or raidz (failsafe SSD) array.
  	// Mirror failsafe arrays must use addMirror().
  	async addDevice(deviceId: string): Promise<boolean> {
@@ -2175,7 +2413,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #addDevice(deviceId: string): Promise<boolean> {
-@@ -1686,7 +1230,7 @@ export default class Raid {
+@@ -1686,7 +1237,7 @@ export default class Raid {
  
  	// Add one mirror pair to a mirror (failsafe HDD) array.
  	async addMirror(deviceIds: [string, string]): Promise<boolean> {
@@ -2184,7 +2422,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #addMirror(deviceIds: [string, string]): Promise<boolean> {
-@@ -1749,7 +1293,7 @@ export default class Raid {
+@@ -1749,7 +1300,7 @@ export default class Raid {
  	// bulk data on HDDs. On a 2TB Umbrel dataset this is ~15GB. 64k would jump to ~150GB which is
  	// unpredictable on larger/different workloads, so we stay conservative.
  	async addAccelerator(deviceIds: string[]): Promise<boolean> {
@@ -2193,7 +2431,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #addAccelerator(deviceIds: string[]): Promise<boolean> {
-@@ -1974,7 +1518,7 @@ export default class Raid {
+@@ -1974,7 +1525,7 @@ export default class Raid {
  
  	// Replace a storage or accelerator device in the RAID array.
  	async replaceDevice(oldDeviceId: string, newDeviceId: string): Promise<boolean> {
@@ -2202,7 +2440,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #replaceDevice(oldDeviceId: string, newDeviceId: string): Promise<boolean> {
-@@ -2023,7 +1567,7 @@ export default class Raid {
+@@ -2023,7 +1574,7 @@ export default class Raid {
  	// Transition an SSD storage array to a failsafe (raidz1) array.
  	// This creates a degraded raidz1 pool with the new disk and syncs data from the old pool.
  	async transitionToFailsafeRaidz(newDeviceId: string): Promise<boolean> {
@@ -2211,7 +2449,7 @@ index b032df8f..6690b48b 100644
  	}
  
  	async #transitionToFailsafeRaidz(newDeviceId: string): Promise<boolean> {
-@@ -2200,9 +1744,7 @@ export default class Raid {
+@@ -2200,9 +1751,7 @@ export default class Raid {
  		pairs: FailsafeMirrorTransitionPair[],
  		acceleratorDeviceId?: string,
  	): Promise<boolean> {
@@ -2292,7 +2530,7 @@ index 1ce8a2b5..483f49ab 100644
 +	return false
  }
 diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
-index 67bc18f7..167afde0 100644
+index 67bc18f7..7b79d968 100644
 --- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
 +++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
 @@ -22,6 +22,15 @@ import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-ga
@@ -2354,13 +2592,15 @@ index 67bc18f7..167afde0 100644
  		const server = this.createMuxServer({
  			listenPort: entry.route.publicPort,
  			httpPort: this.serverPort(entry.gatewayServer),
-@@ -1224,6 +1248,52 @@ export default class LanIngress {
+@@ -1224,6 +1248,54 @@ export default class LanIngress {
  		activeSockets.clear()
  	}
  
 +	// Docker: make sure exactly one relay container publishes each app port on the host.
 +	// The label records the forwarding target so a changed route recreates its relay.
 +	private async reconcileDockerRelays(routes: AppIngressRoute[]) {
++		const containerName = DOCKER_CONTAINER_NAME
++		if (!containerName) return
 +		const format = `{{.Names}}\t{{.State}}\t{{.Label "${DOCKER_RELAY_LABEL}"}}`
 +		const {stdout} = await $`docker ps --all --filter label=${DOCKER_RELAY_LABEL} --format ${format}`
 +		const existing = new Map(
@@ -2390,7 +2630,7 @@ index 67bc18f7..167afde0 100644
 +		for (const [name, {route, spec}] of desired) {
 +			if (existing.has(name)) continue
 +			try {
-+				await $`docker run --detach --name ${name} --label ${`${DOCKER_RELAY_LABEL}=${spec}`} --network ${DOCKER_RELAY_NETWORK} --restart unless-stopped --publish ${`${route.publicPort}:${route.publicPort}`} ${DOCKER_RELAY_IMAGE} TCP-LISTEN:${route.publicPort},fork,reuseaddr TCP:${DOCKER_CONTAINER_NAME}:${route.hiddenPort}`
++				await $`docker run --detach --name ${name} --label ${`${DOCKER_RELAY_LABEL}=${spec}`} --network ${DOCKER_RELAY_NETWORK} --restart unless-stopped --publish ${`${route.publicPort}:${route.publicPort}`} ${DOCKER_RELAY_IMAGE} TCP-LISTEN:${route.publicPort},fork,reuseaddr TCP:${containerName}:${route.hiddenPort}`
 +				this.logger.log(`Published port ${route.publicPort} for ${route.id}`)
 +			} catch (error) {
 +				// Docker leaves a created-but-not-started container behind on port conflicts
@@ -2407,7 +2647,7 @@ index 67bc18f7..167afde0 100644
  	private async closeAllServers() {
  		for (const wait of this.#appGatewayWaits.values()) wait.controller.abort()
  		this.#appGatewayWaits.clear()
-@@ -1255,6 +1325,7 @@ export default class LanIngress {
+@@ -1255,6 +1327,7 @@ export default class LanIngress {
  		redirectRoutes: IngressPortMapping[],
  		hiddenPortRoutes: IngressPortMapping[] = redirectRoutes,
  	) {
@@ -2415,6 +2655,29 @@ index 67bc18f7..167afde0 100644
  		const nftRuleset = this.buildNftRuleset(redirectRoutes, hiddenPortRoutes)
  		await $({input: nftRuleset})`${NFT_BIN} -f -`
  	}
+diff --git a/packages/umbreld/source/modules/machines/cloud-init.unit.test.ts b/packages/umbreld/source/modules/machines/cloud-init.unit.test.ts
+index f48beeec..93008f8b 100644
+--- a/packages/umbreld/source/modules/machines/cloud-init.unit.test.ts
++++ b/packages/umbreld/source/modules/machines/cloud-init.unit.test.ts
+@@ -137,6 +137,8 @@ describe('Machines cloud-init seed', () => {
+ 			['dnf', 'install', '-y', '@workstation-product-environment'],
+ 			['systemctl', 'enable', 'gdm.service'],
+ 			['systemctl', 'set-default', 'graphical.target'],
++			// Docker: keeps cloud-init from probing cloud datasources once the seed is removed
++			['touch', '/etc/cloud/cloud-init.disabled'],
+ 		])
+ 		expect(config.power_state.mode).toBe('reboot')
+ 	})
+@@ -181,7 +183,8 @@ describe('Machines cloud-init seed', () => {
+ 		expect(script).toContain('install "$translation"')
+ 		expect(script).toContain('if [ "$(uname -m)" = x86_64 ]; then')
+ 		expect(script).toMatch(/timeout 900 \/usr\/local\/bin\/umbrel-waydroid-arm-translation \|\|/)
+-		expect(config.runcmd.at(-1)).toEqual(['systemctl', 'set-default', 'graphical.target'])
++		expect(config.runcmd.at(-2)).toEqual(['systemctl', 'set-default', 'graphical.target'])
++		expect(config.runcmd.at(-1)).toEqual(['touch', '/etc/cloud/cloud-init.disabled'])
+ 		expect(config.power_state.mode).toBe('reboot')
+ 	})
+ })
 diff --git a/packages/umbreld/source/modules/machines/domain.ts b/packages/umbreld/source/modules/machines/domain.ts
 index 4d26ea18..9538d509 100644
 --- a/packages/umbreld/source/modules/machines/domain.ts
@@ -3197,7 +3460,7 @@ index 5c6c3b20..20b5d075 100644
  		}),
  })
 diff --git a/packages/umbreld/source/modules/system/system.ts b/packages/umbreld/source/modules/system/system.ts
-index 3ccfcfd5..e67af46b 100644
+index 3ccfcfd5..4eca19e3 100644
 --- a/packages/umbreld/source/modules/system/system.ts
 +++ b/packages/umbreld/source/modules/system/system.ts
 @@ -14,13 +14,23 @@ import {escapeSpecialRegExpLiterals} from '../utilities/regexp.js'
@@ -3225,7 +3488,7 @@ index 3ccfcfd5..e67af46b 100644
  	const temperature = cpuTemperature.main
  
  	// CPU temperature warnings are temporarily disabled for the umbrelOS 2.0 beta.
-@@ -264,42 +274,22 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+@@ -264,42 +274,25 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
  	apps: MemoryUsage[]
  	machines: Array<{id: string; name: string; osId: string; used: number}>
  }> {
@@ -3246,9 +3509,11 @@ index 3ccfcfd5..e67af46b 100644
 -		getDockerContainerIds(),
 -		getZramRamFactor(),
 -		umbreld.machines.runtimeResourceUsage(),
--	])
++	const [containerMemory, machineUsage] = await Promise.all([
++		getDockerContainerMemory(umbreld),
++		getMachineUsage(umbreld),
+ 	])
 -	const safeZramRamFactor = clampNonNegativeNumber(zramRamFactor)
-+	const containerMemory = await getDockerContainerMemory(umbreld)
  
  	const apps = await Promise.all(
  		umbreld.apps.instances.map(async (app) => {
@@ -3275,21 +3540,27 @@ index 3ccfcfd5..e67af46b 100644
  				}
  			} catch (error) {
  				umbreld.logger.error(`Error getting memory`, error)
-@@ -313,15 +303,70 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+@@ -311,7 +304,7 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+ 		}),
+ 	)
  
- 	// Calculate memory used by the system (total - apps)
+-	// Calculate memory used by the system (total - apps)
++	// Calculate memory used by the system (total - apps - machines)
  	const appsTotal = clampByteCount(apps.reduce((total, app) => total + app.used, 0))
--	const machinesTotal = clampByteCount(machineUsage.memory.reduce((total, machine) => total + machine.used, 0))
--	const system = clampByteCount(totalUsed - appsTotal - machinesTotal, totalUsed)
-+	const system = clampByteCount(totalUsed - appsTotal, totalUsed)
+ 	const machinesTotal = clampByteCount(machineUsage.memory.reduce((total, machine) => total + machine.used, 0))
+ 	const system = clampByteCount(totalUsed - appsTotal - machinesTotal, totalUsed)
+@@ -325,6 +318,73 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+ 	}
+ }
  
- 	return {
- 		size,
- 		totalUsed,
- 		system,
- 		apps,
--		machines: machineUsage.memory,
-+		machines: [],
++// Docker: machines run inside the Umbrel container, libvirt reports their usage.
++// Stats must keep working when Machines is unavailable or libvirt fails.
++async function getMachineUsage(umbreld: Umbreld) {
++	try {
++		return await umbreld.machines.runtimeResourceUsage()
++	} catch (error) {
++		umbreld.logger.error('Failed to read machine resource usage', error)
++		return {cpu: [], memory: []}
 +	}
 +}
 +
@@ -3346,10 +3617,13 @@ index 3ccfcfd5..e67af46b 100644
 +	} catch (error) {
 +		umbreld.logger.error('Failed to read Docker memory statistics', error)
 +		return new Map()
- 	}
- }
- 
-@@ -421,88 +466,187 @@ export function aggregateGpuUsage(rawDevices: GpuDeviceUsage[], pidToApp: Map<nu
++	}
++}
++
+ type GpuAppUsage = {
+ 	id: string
+ 	used: number
+@@ -421,81 +481,158 @@ export function aggregateGpuUsage(rawDevices: GpuDeviceUsage[], pidToApp: Map<nu
  	}
  }
  
@@ -3370,22 +3644,24 @@ index 3ccfcfd5..e67af46b 100644
 +	uptime: number
 +	processes: Map<number, {ticks: number; startTime: number; containerId: string | null}>
 +}
-+
+ 
+-	// Get lines
+-	const lines = top.stdout.split('\n').map((line) => line.trim().split(/\s+/))
 +const CLOCK_TICKS_PER_SECOND = 100
 +const CPU_SNAPSHOT_MAX_AGE = 10_000
 +const CPU_SAMPLE_INTERVAL = 500
 +const CPU_USAGE_CACHE_TIME = 750
 +const CONTAINER_IDS_CACHE_TIME = 5_000
  
--	// Get lines
--	const lines = top.stdout.split('\n').map((line) => line.trim().split(/\s+/))
+-	// Find header and CPU column
+-	const headerIndex = lines.findIndex((line) => line[0] === 'PID')
+-	const cpuIndex = lines[headerIndex].findIndex((column) => column === '%CPU')
 +let lastCpuSnapshot: CpuSnapshot | undefined
 +let cpuUsageCache: {time: number; promise: ReturnType<typeof computeCpuUsage>} | undefined
 +let containerIdsCache: {time: number; ids: Map<string, string>} | undefined
  
--	// Find header and CPU column
--	const headerIndex = lines.findIndex((line) => line[0] === 'PID')
--	const cpuIndex = lines[headerIndex].findIndex((column) => column === '%CPU')
+-	// Get CPU threads
+-	const threads = os.cpus().length
 +async function readProcessCpu(pid: number) {
 +	try {
 +		const [stat, cgroup] = await Promise.all([
@@ -3406,15 +3682,6 @@ index 3ccfcfd5..e67af46b 100644
 +	}
 +}
  
--	// Get CPU threads
--	const threads = os.cpus().length
-+async function readCpuSnapshot(): Promise<CpuSnapshot> {
-+	const [stat, uptime, entries] = await Promise.all([
-+		fse.readFile('/proc/stat', 'utf8'),
-+		fse.readFile('/proc/uptime', 'utf8'),
-+		fse.readdir('/proc'),
-+	])
- 
 -	// Ignore lines before the header
 -	const processes = lines.slice(headerIndex + 1).map((line) => {
 -		// Parse values
@@ -3423,6 +3690,13 @@ index 3ccfcfd5..e67af46b 100644
 -			// Convert to % of total system not % of a single thread
 -			cpu: parseFloat(line[cpuIndex]) / threads,
 -		}
++async function readCpuSnapshot(): Promise<CpuSnapshot> {
++	const [stat, uptime, entries] = await Promise.all([
++		fse.readFile('/proc/stat', 'utf8'),
++		fse.readFile('/proc/uptime', 'utf8'),
++		fse.readdir('/proc'),
++	])
++
 +	// cpu  user nice system idle iowait irq softirq steal guest guest_nice
 +	const cpu = stat.split('\n')[0].trim().split(/\s+/).slice(1).map(Number)
 +	// guest and guest_nice are already included in user and nice
@@ -3473,13 +3747,13 @@ index 3ccfcfd5..e67af46b 100644
 +		const [id, name] = line.trim().split(' ')
 +		if (id && name) ids.set(name, id)
 +	}
-+
-+	containerIdsCache = {time: Date.now(), ids}
-+	return ids
-+}
  
 -	// Calculate total CPU used by all processes
 -	const totalUsed = processes.reduce((total, process) => total + process.cpu, 0)
++	containerIdsCache = {time: Date.now(), ids}
++	return ids
++}
++
 +async function computeCpuUsage(umbreld: Umbreld) {
 +	// Take a short sample when there is no recent snapshot to compare against
 +	let previous = lastCpuSnapshot
@@ -3538,23 +3812,24 @@ index 3ccfcfd5..e67af46b 100644
  		}),
  	)
  
- 	// Calculate CPU used by the system (total - apps)
+-	// Calculate CPU used by the system (total - apps)
++	// Calculate CPU used by the system (total - apps - machines). QEMU runs in the
++	// Umbrel container, so machines are not part of any app container.
++	const machineUsage = await getMachineUsage(umbreld)
  	const appsTotal = apps.reduce((total, app) => total + app.used, 0)
--	const machinesTotal = machineUsage.cpu.reduce((total, machine) => total + machine.used, 0)
--	const system = Math.max(0, totalUsed - appsTotal - machinesTotal)
--
+ 	const machinesTotal = machineUsage.cpu.reduce((total, machine) => total + machine.used, 0)
+ 	const system = Math.max(0, totalUsed - appsTotal - machinesTotal)
+ 
 -	// Get total CPU threads
 -	const threads = os.cpus().length
-+	const system = Math.max(0, totalUsed - appsTotal)
- 
+-
  	return {
 -		threads,
 +		threads: os.cpus().length,
  		totalUsed,
  		system,
  		apps,
--		machines: machineUsage.cpu,
-+		machines: [] as Array<{id: string; name: string; osId: string; used: number}>,
+@@ -503,6 +640,31 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
  	}
  }
  
@@ -3586,7 +3861,7 @@ index 3ccfcfd5..e67af46b 100644
  // TODO: For powercycle methods we will probably want to handle cleanly stopping
  // as much Umbrel stuff as possible ourselves before handing over to the OS.
  // This will give us more control over the order of things terminating and allow
-@@ -510,78 +654,40 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
+@@ -510,78 +672,40 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
  // umbreld gets killed.
  
  export async function shutdown(): Promise<boolean> {
@@ -3685,7 +3960,7 @@ index 3ccfcfd5..e67af46b 100644
  }
  
  export async function isRaspberryPi() {
-@@ -609,108 +715,23 @@ export async function setupPiCpuGovernor(umbreld: Umbreld): Promise<void> {
+@@ -609,108 +733,23 @@ export async function setupPiCpuGovernor(umbreld: Umbreld): Promise<void> {
  }
  
  export async function hasWifi() {
@@ -3800,7 +4075,7 @@ index 3ccfcfd5..e67af46b 100644
  }
  
  // Get IP addresses of the device
-@@ -778,81 +799,7 @@ type NetworkInterface = {
+@@ -778,81 +817,7 @@ type NetworkInterface = {
  
  // Get all physical network interfaces with connection details
  export async function getNetworkInterfaces(umbreld?: Umbreld): Promise<NetworkInterface[]> {
@@ -3883,7 +4158,7 @@ index 3ccfcfd5..e67af46b 100644
  }
  
  // Find an interface by MAC address
-@@ -936,100 +883,24 @@ export async function setStaticIp(
+@@ -936,100 +901,24 @@ export async function setStaticIp(
  	umbreld: Umbreld,
  	config: {mac: string; ip: string; subnetPrefix: number; gateway: string; dns: string[]},
  ) {
@@ -3988,7 +4263,7 @@ index 3ccfcfd5..e67af46b 100644
  }
  
  // Wait for Pi system time to be synced for up to the number of seconds passed in.
-@@ -1058,41 +929,13 @@ export async function waitForSystemTime(umbreld: Umbreld, timeout: number): Prom
+@@ -1058,41 +947,13 @@ export async function waitForSystemTime(umbreld: Umbreld, timeout: number): Prom
  }
  
  export async function getHostname() {
@@ -4034,6 +4309,90 @@ index 3ccfcfd5..e67af46b 100644
  	return hostname
  }
  
+diff --git a/packages/umbreld/source/modules/system/system.unit.test.ts b/packages/umbreld/source/modules/system/system.unit.test.ts
+index acd27c39..afeb5588 100644
+--- a/packages/umbreld/source/modules/system/system.unit.test.ts
++++ b/packages/umbreld/source/modules/system/system.unit.test.ts
+@@ -117,11 +117,12 @@ describe('getMemoryUsage', () => {
+ 				getContainerNames: async () => ['test_web_1'],
+ 			},
+ 		]
++		// Docker: app memory comes from `docker stats`
+ 		vi.mocked(execa.$).mockImplementation(async (...args: any[]) => {
+ 			const template = args[0]
+ 			const str = Array.isArray(template) ? template.join('') : String(template)
+-			if (str.includes('docker ps')) {
+-				return {stdout: 'abc123def456|test_web_1'} as any
++			if (str.includes('docker stats')) {
++				return {stdout: JSON.stringify({Name: 'test_web_1', MemUsage: '9.77MiB / 1GiB'})} as any
+ 			}
+ 			return {stdout: ''} as any
+ 		})
+@@ -160,26 +161,52 @@ describe('getMemoryUsage', () => {
+ 	})
+ })
+ 
++// Docker: shutdown stops the Umbrel container and reboot restarts umbreld
++// through the entrypoint, instead of powering off or rebooting the host.
++function mockDockerCommands() {
++	const commands: string[] = []
++	const tag = vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
++		commands.push(
++			strings.reduce((result, part, index) => result + part + (index < values.length ? String(values[index]) : ''), ''),
++		)
++		return {stdout: ''}
++	})
++	vi.mocked(execa.$).mockImplementation(((first: unknown, ...rest: unknown[]) =>
++		Array.isArray(first) ? tag(first as unknown as TemplateStringsArray, ...rest) : tag) as any)
++	return commands
++}
++
+ describe('shutdown', () => {
+-	test('should call execa.$ with "poweroff"', async () => {
++	const containerName = process.env.UMBREL_CONTAINER_NAME
++
++	afterEach(() => {
++		if (containerName === undefined) delete process.env.UMBREL_CONTAINER_NAME
++		else process.env.UMBREL_CONTAINER_NAME = containerName
++	})
++
++	test('should stop the Umbrel container instead of powering off the host', async () => {
++		process.env.UMBREL_CONTAINER_NAME = 'umbrel'
++		const commands = mockDockerCommands()
+ 		expect(await shutdown()).toBe(true)
+-		expect(execa.$).toHaveBeenCalledWith(['poweroff'])
++		await new Promise((resolve) => setTimeout(resolve, 400))
++		expect(commands).toEqual(['docker stop --time 50 umbrel'])
+ 	})
+ 
+-	test('should throw error when "poweroff" command fails', async () => {
+-		vi.mocked(execa.$).mockRejectedValue(new Error('Failed'))
+-		await expect(shutdown()).rejects.toThrow()
++	test('should throw error when the Umbrel container name is unknown', async () => {
++		delete process.env.UMBREL_CONTAINER_NAME
++		const commands = mockDockerCommands()
++		await expect(shutdown()).rejects.toThrow('Failed to determine the Umbrel container name.')
++		expect(commands).toEqual([])
+ 	})
+ })
+ 
+ describe('reboot', () => {
+-	test('should call execa.$ with "reboot"', async () => {
++	test('should exit with the restart code handled by the entrypoint', async () => {
++		const commands = mockDockerCommands()
++		const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+ 		expect(await reboot()).toBe(true)
+-		expect(execa.$).toHaveBeenCalledWith(['reboot'])
+-	})
+-
+-	test('should throw error when "shutdown" command fails', async () => {
+-		vi.mocked(execa.$).mockRejectedValue(new Error('Failed'))
+-		await expect(reboot()).rejects.toThrow()
++		await new Promise((resolve) => setTimeout(resolve, 400))
++		expect(exit).toHaveBeenCalledWith(75)
++		expect(commands).toEqual([])
+ 	})
+ })
 diff --git a/packages/umbreld/source/modules/system/update.ts b/packages/umbreld/source/modules/system/update.ts
 index 7bb8551e..240daca7 100644
 --- a/packages/umbreld/source/modules/system/update.ts
