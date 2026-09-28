@@ -1,0 +1,4136 @@
+diff --git a/packages/umbreld/source/cli.ts b/packages/umbreld/source/cli.ts
+index 6edf961a..e306638b 100755
+--- a/packages/umbreld/source/cli.ts
++++ b/packages/umbreld/source/cli.ts
+@@ -5,16 +5,8 @@ import arg from 'arg'
+ import camelcaseKeys from 'camelcase-keys'
+ 
+ import {cliClient} from './modules/cli-client.js'
+-import blacklistUas from './modules/blacklist-uas/blacklist-uas.js'
+-
+ import Umbreld, {type UmbreldOptions} from './index.js'
+ 
+-// Blacklists uas drivers early in the boot process
+-if (process.argv.includes('blacklist-uas')) {
+-	await blacklistUas()
+-	process.exit(0)
+-}
+-
+ // Quick trpc client for testing
+ if (process.argv.includes('client')) {
+ 	const clientIndex = process.argv.indexOf('client')
+@@ -65,9 +57,14 @@ async function cleanShutdown(signal: string) {
+ 	if (isShuttingDown) return
+ 	isShuttingDown = true
+ 
+-	umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
+-	await umbreld.stop()
+-	process.exit(0)
++	try {
++		umbreld.logger.log(`Received ${signal}, shutting down cleanly...`)
++		await umbreld.stop()
++	} catch (error) {
++		umbreld.logger.error('Failed to shut down Umbrel cleanly', error)
++	} finally {
++		process.exit(130)
++	}
+ }
+ process.on('SIGINT', cleanShutdown.bind(null, 'SIGINT'))
+ process.on('SIGTERM', cleanShutdown.bind(null, 'SIGTERM'))
+diff --git a/packages/umbreld/source/index.ts b/packages/umbreld/source/index.ts
+index 619f42ca..89225baf 100644
+--- a/packages/umbreld/source/index.ts
++++ b/packages/umbreld/source/index.ts
+@@ -44,6 +44,8 @@ type StoreSchema = {
+ 	previousVersion?: string
+ 	discoveryId?: string
+ 	apps: string[]
++	// Docker: IDs of images Umbrel has used, the only ones it may clean up
++	managedDockerImages?: string[]
+ 	// Apps the owner has shared with member accounts. 'all' also covers
+ 	// members created in the future.
+ 	appMemberShares?: {
+diff --git a/packages/umbreld/source/modules/apps/app.ts b/packages/umbreld/source/modules/apps/app.ts
+index bdaa66bb..17f8d098 100644
+--- a/packages/umbreld/source/modules/apps/app.ts
++++ b/packages/umbreld/source/modules/apps/app.ts
+@@ -10,7 +10,7 @@ import {type Compose} from 'compose-spec-schema'
+ import {$} from 'execa'
+ import fetch from 'node-fetch'
+ import stripAnsi from 'strip-ansi'
+-import pRetry from 'p-retry'
++import pRetry, {AbortError} from 'p-retry'
+ 
+ import getDirectorySize from '../utilities/get-directory-size.js'
+ import {
+@@ -87,6 +87,41 @@ type ParsedComposeMount = ParsedVolume & {
+ 	serviceName: string
+ }
+ 
++// Docker: turn host port conflicts into an actionable message and stop retrying,
++// since retries cannot free a port owned by another service on the Docker host.
++function getDockerPortError(error: unknown) {
++	const details = [
++		error instanceof Error ? error.message : '',
++		typeof (error as {stderr?: unknown})?.stderr === 'string' ? (error as {stderr: string}).stderr : '',
++		typeof (error as {stdout?: unknown})?.stdout === 'string' ? (error as {stdout: string}).stdout : '',
++	]
++		.filter(Boolean)
++		.join('\n')
++
++	if (!/(port is already allocated|address already in use|bind .* failed)/i.test(details)) return
++
++	const port =
++		details.match(/(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::):([0-9]+)/)?.[1] ||
++		details.match(/port[ =:]([0-9]+)/i)?.[1]
++
++	const message = port
++		? `Port ${port} is already in use on the Docker host. Stop the conflicting service before starting this app.`
++		: 'A port required by this app is already in use on the Docker host. Stop the conflicting service before starting this app.'
++
++	return new AbortError(new Error(message, {cause: error}))
++}
++
++// Docker: the Lightning REST port collides with common host services, publish it on 8558 instead.
++async function patchLightningRestPort(path: string) {
++	let yaml = await fse.readFile(path, 'utf8')
++
++	const find = '$APP_LIGHTNING_NODE_REST_PORT:$APP_LIGHTNING_NODE_REST_PORT'
++	if (!yaml.includes(find)) return
++	yaml = yaml.replaceAll(find, '8558:$APP_LIGHTNING_NODE_REST_PORT')
++
++	await fse.writeFile(path, yaml)
++}
++
+ export type AppFolderAccessSlot = {
+ 	id: string
+ 	name: string
+@@ -691,7 +726,11 @@ export default class App {
+ 				this.appGatewayEnabled = true
+ 				await this.refreshLanIngress()
+ 			}
+-			const result = await appScript(this.#umbreld, command, this.id, inheritStdio, {maxOutputBytes, dataRoots})
++			const result = await appScript(this.#umbreld, command, this.id, inheritStdio, {maxOutputBytes, dataRoots}).catch(
++				(error) => {
++					throw getDockerPortError(error) || error
++				},
++			)
+ 			if (['stop', 'force-stop', 'pre-patch-update', 'nuke-images'].includes(command)) {
+ 				this.appGatewayEnabled = false
+ 				await this.refreshLanIngress()
+@@ -1326,6 +1365,7 @@ export default class App {
+ 		}
+ 
+ 		await this.writeCompose(compose)
++		await patchLightningRestPort(`${this.dataDirectory}/docker-compose.yml`)
+ 	}
+ 
+ 	async hasAppProxy() {
+@@ -2750,8 +2790,19 @@ export default class App {
+ 
+ 		if (!containerName) throw new Error(`No container_name found for service ${service} in app ${this.id}`)
+ 
+-		const {stdout: containerIp} =
+-			await $`docker inspect -f {{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}} ${containerName}`
++		// Docker: the Umbrel container only reaches apps through umbrel_main_network.
++		const {stdout} = await $`docker inspect ${containerName}`
++		const container = JSON.parse(stdout)?.[0] as {
++			NetworkSettings?: {
++				Networks?: Record<string, {IPAddress?: string}>
++			}
++		}
++		const networks = container?.NetworkSettings?.Networks || {}
++		const containerIp =
++			networks.umbrel_main_network?.IPAddress ||
++			Object.values(networks).find((network) => network.IPAddress)?.IPAddress
++
++		if (!containerIp) throw new Error(`No IP address found for container ${containerName}`)
+ 
+ 		return containerIp
+ 	}
+diff --git a/packages/umbreld/source/modules/apps/apps.ts b/packages/umbreld/source/modules/apps/apps.ts
+index 6e190c1c..dddc3437 100644
+--- a/packages/umbreld/source/modules/apps/apps.ts
++++ b/packages/umbreld/source/modules/apps/apps.ts
+@@ -66,32 +66,55 @@ export default class Apps {
+ 			expectedImages.push(...(await app.getExpectedImages()))
+ 		}
+ 		this.logger.log('Cleaning up unused Docker images')
+-		await removeUnusedImages(expectedImages, this.logger)
++		const managedIds = new Set((await this.#umbreld.store.get('managedDockerImages')) ?? [])
++		const nextManagedIds = await removeUnusedImages(expectedImages, this.logger, managedIds)
++		await this.#umbreld.store.set('managedDockerImages', [...nextManagedIds])
+ 	}
+ 
+-	// This is a really brutal and heavy handed way of cleaning up old Docker state.
+-	// We should only do this sparingly. It's needed if an old version of Docker
+-	// didn't shutdown cleanly and then we update to a new version of Docker.
+-	// The next version of Docker can have issues starting containers if the old
+-	// containers/networks are still hanging around. We had this issue because sometimes
+-	// 0.5.4 installs didn't clean up properly on shutdown and it causes critical errors
+-	// bringing up containers in 1.0.
++	// Clean up stale Umbrel containers without affecting unrelated host workloads.
++	// Network cleanup remains disabled because Compose network labels do not
++	// identify Umbrel ownership reliably enough.
+ 	async cleanDockerState() {
+ 		try {
+-			const containerIds = (await $`docker ps -aq`).stdout.split('\n').filter(Boolean)
+-			if (containerIds.length) {
+-				this.logger.log('Cleaning up old containers...')
+-				await $({stdio: 'inherit'})`docker stop --time 30 ${containerIds}`
+-				await $({stdio: 'inherit'})`docker rm ${containerIds}`
++			const containerIds = (await $`docker ps -aq --filter label=com.docker.compose.project`).stdout
++				.split('\n')
++				.filter(Boolean)
++			if (!containerIds.length) return
++
++			const containers = JSON.parse((await $`docker inspect ${containerIds}`).stdout)
++			const dataDirectory = this.#umbreld.dataDirectory
++			const appDataDirectory = `${dataDirectory}/app-data/`
++			const outerContainerName = process.env.UMBREL_CONTAINER_NAME
++			const ownedContainerIds = containers
++				.filter((container: any) => {
++					const containerName = String(container?.Name ?? '').replace(/^\//, '')
++					if (outerContainerName && containerName === outerContainerName) return false
++
++					const labels = container?.Config?.Labels ?? {}
++					const workingDirectory = labels['com.docker.compose.project.working_dir'] ?? ''
++					const configFiles = labels['com.docker.compose.project.config_files'] ?? ''
++
++					return (
++						workingDirectory === dataDirectory ||
++						workingDirectory.startsWith(appDataDirectory) ||
++						configFiles
++							.split(',')
++							.some(
++								(file: string) =>
++									file === `${dataDirectory}/docker-compose.yml` || file.startsWith(appDataDirectory),
++							)
++					)
++				})
++				.map((container: any) => container.Id)
++				.filter(Boolean)
++
++			if (ownedContainerIds.length) {
++				this.logger.log('Cleaning up old Umbrel containers...')
++				await $({stdio: 'inherit'})`docker stop --time 30 ${ownedContainerIds}`
++				await $({stdio: 'inherit'})`docker rm ${ownedContainerIds}`
+ 			}
+ 		} catch (error) {
+-			this.logger.error(`Failed to clean containers`, error)
+-		}
+-		try {
+-			this.logger.log('Cleaning up old networks...')
+-			await $({stdio: 'inherit'})`docker network prune -f`
+-		} catch (error) {
+-			this.logger.error(`Failed to clean networks`, error)
++			this.logger.error('Failed to clean Umbrel containers', error)
+ 		}
+ 	}
+ 
+@@ -210,7 +233,7 @@ export default class Apps {
+ 
+ 		// Attempt to pre-load local Docker images
+ 		try {
+-			// Loop over iamges in /images
++			// Loop over images in /images
+ 			const images = await fse.readdir(`/images`)
+ 			await Promise.all(
+ 				images.map(async (image) => {
+diff --git a/packages/umbreld/source/modules/apps/image-cleanup.ts b/packages/umbreld/source/modules/apps/image-cleanup.ts
+index fbe45da0..33514e10 100644
+--- a/packages/umbreld/source/modules/apps/image-cleanup.ts
++++ b/packages/umbreld/source/modules/apps/image-cleanup.ts
+@@ -75,7 +75,16 @@ const isMissingImage = (error: unknown) => (error as {statusCode?: number})?.sta
+ 
+ // Call only after collecting the complete expected set. An unreadable installed
+ // app must abort the sweep, rather than accidentally making its images unused.
+-export async function removeUnusedImages(expectedImages: string[], logger: Logger, docker = new Dockerode()) {
++// Docker: the daemon is shared with other workloads, so only images in
++// managedIds (images Umbrel has expected before) are ever removed. Returns the
++// updated managed set: previously managed images still present plus the ones
++// expected now.
++export async function removeUnusedImages(
++	expectedImages: string[],
++	logger: Logger,
++	managedIds: ReadonlySet<string>,
++	docker = new Dockerode(),
++) {
+ 	const expectedIds = new Set<string>()
+ 	for (const reference of new Set(expectedImages)) {
+ 		try {
+@@ -89,8 +98,13 @@ export async function removeUnusedImages(expectedImages: string[], logger: Logge
+ 
+ 	const images = await docker.listImages({all: true})
+ 	const containerImages = new Set((await docker.listContainers({all: true})).map((container) => container.ImageID))
++	const nextManagedIds = new Set(expectedIds)
+ 	for (const image of images) {
+-		if (expectedIds.has(image.Id) || containerImages.has(image.Id)) continue
++		if (!managedIds.has(image.Id) || expectedIds.has(image.Id)) continue
++		if (containerImages.has(image.Id)) {
++			nextManagedIds.add(image.Id)
++			continue
++		}
+ 		try {
+ 			// Removing by ID refuses images with multiple repository references.
+ 			// Remove their references individually, without forcing or pruning parents.
+@@ -110,6 +124,9 @@ export async function removeUnusedImages(expectedImages: string[], logger: Logge
+ 			// Docker remains the final authority, including if a container starts
+ 			// using this image while we are trying to delete it.
+ 			logger.error(`Could not remove unused Docker image ${image.Id}`, error)
++			nextManagedIds.add(image.Id)
+ 		}
+ 	}
++
++	return nextManagedIds
+ }
+diff --git a/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts b/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts
+index e1ca75b6..4e99b6fd 100644
+--- a/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts
++++ b/packages/umbreld/source/modules/apps/legacy-compat/app-environment.ts
+@@ -2,6 +2,7 @@ import {fileURLToPath} from 'node:url'
+ import {dirname, join} from 'node:path'
+ 
+ import {$} from 'execa'
++import fse from 'fs-extra'
+ 
+ import type Umbreld from '../../../index.js'
+ 
+@@ -30,19 +31,31 @@ export default async function appEnvironment(umbreld: Umbreld, command: string)
+ 			TOR_PASSWORD: 'mLcLDdt5qqMxlq3wv8Din3UD44bTZHzRFhIktw38kWg=',
+ 			TOR_HASHED_PASSWORD: '16:158FBE422B1A9D996073BE2B9EC38852C70CE12362CA016F8F6859C426',
+ 			UMBREL_LEGACY_COMPAT_DIR: currentDirname,
+-			UMBREL_TORRC: torEnabled ? `${currentDirname}/tor-server-torrc` : `${currentDirname}/tor-proxy-torrc`,
++			UMBREL_TORRC: torEnabled
++				? `${umbreld.dataDirectory}/tor/tor-server-torrc`
++				: `${umbreld.dataDirectory}/tor/tor-proxy-torrc`,
+ 		},
+ 	}
++
+ 	if (command === 'up') {
++		// Docker: Copy torrc files to data directory so they're accessible to tor containers.
++		// The hidden services target the host gateway on umbrelOS, but the Umbrel
++		// container owns the dashboard and app ports here.
++		const containerIp = process.env.UMBREL_CONTAINER_IP
++		for (const torrc of ['tor-proxy-torrc', 'tor-server-torrc']) {
++			let contents = await fse.readFile(`${currentDirname}/${torrc}`, 'utf8')
++			if (containerIp) contents = contents.replace(/(?:172\.17\.0\.1|10\.21\.0\.1):/g, `${containerIp}:`)
++			await fse.outputFile(`${umbreld.dataDirectory}/tor/${torrc}`, contents)
++		}
+ 		await $(
+ 			options as any,
+-		)`docker compose --project-name umbrel --file ${composePath} ${command} --build --detach --remove-orphans`
++		)`docker compose --project-name umbrelc --file ${composePath} ${command} --build --detach --remove-orphans`
+ 	} else if (command === 'images') {
+ 		const {stdout} = await $(
+ 			options as any,
+-		)`docker compose --project-name umbrel --file ${composePath} --profile * config --images`
++		)`docker compose --project-name umbrelc --file ${composePath} --profile * config --images`
+ 		return stdout.split('\n').filter(Boolean)
+ 	} else {
+-		await $(options as any)`docker compose --project-name umbrel --file ${composePath} ${command}`
++		await $(options as any)`docker compose --project-name umbrelc --file ${composePath} ${command}`
+ 	}
+ }
+diff --git a/packages/umbreld/source/modules/apps/legacy-compat/app-script b/packages/umbreld/source/modules/apps/legacy-compat/app-script
+index 21b09db6..e84a0dbf 100755
+--- a/packages/umbreld/source/modules/apps/legacy-compat/app-script
++++ b/packages/umbreld/source/modules/apps/legacy-compat/app-script
+@@ -218,7 +218,8 @@ source_app() {
+   local _umbrel_runtime_app_data_root
+   _umbrel_runtime_app_data_root="$(printf '%s' "${_umbrel_runtime_data_roots}" | jq --exit-status --raw-output --arg app "${app}" '.[$app]')"
+ 
+-  local -r app_domain="$(hostname -s 2>/dev/null || echo "umbrel").local"
++  local -r device_hostname="${UMBREL_CONTAINER_NAME:-$(hostname -s 2>/dev/null || echo "umbrel")}"
++  local -r app_domain="${device_hostname}.local"
+   local -r app_entropy_identifier="app-${app}-seed"
+ 
+   # Load in existing Umbrel .env
+@@ -229,7 +230,7 @@ source_app() {
+   export NETWORK_IP="${NETWORK_IP}"
+ 
+   # Set other useful vars. used in exports
+-  export DEVICE_HOSTNAME="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "umbrel")"
++  export DEVICE_HOSTNAME="${device_hostname}"
+   export DEVICE_DOMAIN_NAME="${DEVICE_HOSTNAME}.local"
+ 
+   # Set env using all transitive dependencies exports.sh
+@@ -298,9 +299,9 @@ source_app() {
+ 
+   # Tor specific exports
+   export TOR_DATA_DIR="${UMBREL_ROOT}/tor/data"
+-  export TOR_ENTRYPOINT_SCRIPT="${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh"
++  export TOR_ENTRYPOINT_SCRIPT="${UMBREL_ROOT}/tor/tor-entrypoint.sh"
+   export TOR_HS_APP_DIR="/data/app-${app}"
+-  export TOR_HS_PORTS="80:${GATEWAY_IP}:${APP_PROXY_PORT}"
++  export TOR_HS_PORTS="80:${UMBREL_CONTAINER_IP:-${GATEWAY_IP}}:${APP_PROXY_PORT}"
+ 
+   # TODO: Look into why this needed to be commented out for Mark.
+   # tor_extra_hs_varname=$(echo "APP_${APP_ID^^}_TOR_HS_EXTRA_PORTS" | tr '-' '_')
+@@ -476,6 +477,8 @@ compose() {
+   # like Tailscale) must not get a tor_server sidecar, it would crash loop
+   # trying to resolve a hostname that never exists.
+   if [[ "${REMOTE_TOR_ACCESS}" == "true" ]] && [[ "${has_app_proxy_service}" == "true" ]]; then
++    cp "${SCRIPT_DOCKER_FRAGMENTS}/tor-entrypoint.sh" "$TOR_ENTRYPOINT_SCRIPT"
++    chmod +x "$TOR_ENTRYPOINT_SCRIPT"
+     compose_files+=( "--file" "${tor_compose_file}" )
+   fi
+ 
+diff --git a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.common.yml b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.common.yml
+index 2b5b5ad1..8008b84b 100644
+--- a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.common.yml
++++ b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.common.yml
+@@ -1,5 +1,3 @@
+-version: '3.7'
+-
+ networks:
+   default:
+     external:
+diff --git a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.tor.yml b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.tor.yml
+index 50295157..ec20941b 100644
+--- a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.tor.yml
++++ b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.tor.yml
+@@ -1,5 +1,3 @@
+-version: '3.7'
+-
+ services:
+   tor_server:
+     image: ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a
+diff --git a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.yml b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.yml
+index 38e19ec3..e8805712 100644
+--- a/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.yml
++++ b/packages/umbreld/source/modules/apps/legacy-compat/docker-compose.yml
+@@ -1,8 +1,6 @@
+-version: '3.7'
+-
+ services:
+   tor_proxy:
+-    container_name: tor_proxy
++    container_name: umbrel_tor_proxy
+     image: ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a
+     user: '1000:1000'
+     restart: on-failure
+@@ -12,12 +10,9 @@ services:
+     environment:
+       HOME: '/tmp'
+     networks:
+-      default:
++      umbrel_main_network:
+         ipv4_address: $TOR_PROXY_IP
++
+ networks:
+-  default:
+-    name: umbrel_main_network
+-    ipam:
+-      driver: default
+-      config:
+-        - subnet: '$NETWORK_IP/16'
++  umbrel_main_network:
++    external: true
+diff --git a/packages/umbreld/source/modules/backups/backups.ts b/packages/umbreld/source/modules/backups/backups.ts
+index 4f792b0d..dad54a74 100644
+--- a/packages/umbreld/source/modules/backups/backups.ts
++++ b/packages/umbreld/source/modules/backups/backups.ts
+@@ -111,8 +111,6 @@ export default class Backups {
+ 		this.running = true
+ 		this.startedAt = Date.now()
+ 
+-		// Cleanup any left over backup mounts
+-		await this.unmountAll().catch((error) => this.logger.error('Error unmounting backups', error))
+ 		await this.releaseUmbrelDatabaseBackup().catch((error) =>
+ 			this.logger.error('Error cleaning up the Umbrel database backup staging directory', error),
+ 		)
+@@ -129,15 +127,6 @@ export default class Backups {
+ 
+ 		const ONE_SECOND = 1000
+ 
+-		// Cleanup any currently mounted backups (up to 5s)
+-		await Promise.race([
+-			setTimeout(ONE_SECOND * 5),
+-			(async () => {
+-				this.logger.log('Cleaning up mounts')
+-				await this.unmountAll().catch((error) => this.logger.error('Error unmounting backups', error))
+-			})(),
+-		])
+-
+ 		// Kill any running kopia processes
+ 		for (const process of this.runningKopiaProcesses) process.kill('SIGTERM', {forceKillAfterTimeout: ONE_SECOND * 3})
+ 
+diff --git a/packages/umbreld/source/modules/backups/routes.ts b/packages/umbreld/source/modules/backups/routes.ts
+index 4b85c592..cc808390 100644
+--- a/packages/umbreld/source/modules/backups/routes.ts
++++ b/packages/umbreld/source/modules/backups/routes.ts
+@@ -2,6 +2,9 @@ import z from 'zod'
+ 
+ import {router, privateProcedure, publicProcedureWhenNoUserExists} from '../server/trpc/trpc.js'
+ 
++const unsupportedRepositoryMessage =
++	'Creating backup repositories is not supported in Docker. Configure a supported backup destination outside Umbrel.'
++
+ export default router({
+ 	// Get all backup repositories
+ 	getRepositories: privateProcedure.query(async ({ctx}) => {
+@@ -16,10 +19,12 @@ export default router({
+ 		.input(z.object({repositoryId: z.string()}))
+ 		.query(async ({ctx, input}) => ctx.umbreld.backups.getRepositorySize(input.repositoryId)),
+ 
+-	// Create a new backup repository
++	// Creating backup repositories is unavailable because Docker storage destinations are managed externally
+ 	createRepository: privateProcedure
+ 		.input(z.object({path: z.string(), password: z.string()}))
+-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.createRepository(input.path, input.password)),
++		.mutation(async () => {
++			throw new Error(unsupportedRepositoryMessage)
++		}),
+ 
+ 	// Forget a repository
+ 	forgetRepository: privateProcedure
+@@ -50,15 +55,19 @@ export default router({
+ 		)
+ 		.query(async ({ctx, input}) => ctx.umbreld.backups.listBackupFiles(input.backupId, input.path)),
+ 
+-	// Mount a backup
++	// Mount-dependent backup browsing is unavailable in Docker
+ 	mountBackup: privateProcedure
+ 		.input(z.object({backupId: z.string()}))
+-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.mountBackup(input.backupId)),
++		.mutation(async () => {
++			throw new Error('Browsing backups is not supported in Docker.')
++		}),
+ 
+-	// Unmount a backup
++	// Mount-dependent backup browsing is unavailable in Docker
+ 	unmountBackup: privateProcedure
+ 		.input(z.object({directoryName: z.string()}))
+-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.unmountBackup(input.directoryName)),
++		.mutation(async () => {
++			throw new Error('Browsing backups is not supported in Docker.')
++		}),
+ 
+ 	// Get progress of backup operations
+ 	backupProgress: privateProcedure.query(async ({ctx}) => ctx.umbreld.backups.backupsInProgress),
+@@ -76,15 +85,19 @@ export default router({
+ 		.input(z.object({path: z.string()}))
+ 		.mutation(async ({ctx, input}) => ctx.umbreld.backups.removeIgnoredPath(input.path)),
+ 
+-	// Connect to an existing repository
++	// Connecting backup repositories is unavailable because Docker storage destinations are managed externally
+ 	connectToExistingRepository: publicProcedureWhenNoUserExists
+ 		.input(z.object({path: z.string(), password: z.string()}))
+-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.connectToExistingRepository(input.path, input.password)),
++		.mutation(async () => {
++			throw new Error(unsupportedRepositoryMessage)
++		}),
+ 
+-	// Restore a backup
++	// Mount-dependent backup restoration is unavailable in Docker
+ 	restoreBackup: publicProcedureWhenNoUserExists
+ 		.input(z.object({backupId: z.string()}))
+-		.mutation(async ({ctx, input}) => ctx.umbreld.backups.restoreBackup(input.backupId)),
++		.mutation(async () => {
++			throw new Error('Restoring backups is not supported in Docker.')
++		}),
+ 
+ 	// Get status of restore operations
+ 	restoreStatus: publicProcedureWhenNoUserExists.query(async ({ctx}) => ctx.umbreld.backups.restoreStatus),
+diff --git a/packages/umbreld/source/modules/dbus/dbus.ts b/packages/umbreld/source/modules/dbus/dbus.ts
+index b1ca9ba6..9f78bb36 100644
+--- a/packages/umbreld/source/modules/dbus/dbus.ts
++++ b/packages/umbreld/source/modules/dbus/dbus.ts
+@@ -1,14 +1,10 @@
+-// TODO: Move this into a system submodule when we have a
+-// cleaned up system module
++// Stub dbus module for Docker — D-Bus is not available inside a container.
+ 
+-import dbus from '@homebridge/dbus-native'
+-import {throttle} from 'es-toolkit'
+ import type Umbreld from '../../index.js'
+ 
+ export default class Dbus {
+ 	#umbreld: Umbreld
+ 	logger: Umbreld['logger']
+-	#removeDiskEventListeners?: () => void
+ 
+ 	constructor(umbreld: Umbreld) {
+ 		this.#umbreld = umbreld
+@@ -17,55 +13,10 @@ export default class Dbus {
+ 	}
+ 
+ 	async start() {
+-		this.logger.log('Starting dbus')
+-
+-		await this.addDiskEventListeners().catch((error) => {
+-			this.logger.error(`Failed to add disk event listeners`, error)
+-		})
+-	}
+-
+-	async addDiskEventListeners() {
+-		this.logger.log('Attaching disk event listeners')
+-
+-		// Create throttled event emitter since we often get lots of events at once
+-		const sendThrottledEvent = throttle(async () => this.#umbreld.eventBus.emit('system:disk:change'), 100, {
+-			edges: ['leading'],
+-		})
+-
+-		// Setup event handler
+-		const handleDeviceChange = (unitName: string) => {
+-			// Check if we have a new disk device service from systemd
+-			const isDisk = typeof unitName === 'string' && unitName.includes('disk') && unitName.endsWith('.device')
+-			if (isDisk) sendThrottledEvent()
+-		}
+-
+-		// Attach event handler to systemd service events
+-		return new Promise((resolve, reject) => {
+-			dbus
+-				.systemBus()
+-				.getService('org.freedesktop.systemd1')
+-				.getInterface('/org/freedesktop/systemd1', 'org.freedesktop.systemd1.Manager', (error, manager) => {
+-					if (error) return reject(error)
+-
+-					// Add listeners
+-					manager.addListener('UnitNew', handleDeviceChange)
+-					manager.addListener('UnitRemoved', handleDeviceChange)
+-
+-					// Create cleanup function
+-					this.#removeDiskEventListeners = () => {
+-						this.logger.log('Removing disk event listeners')
+-						manager.removeListener('UnitNew', handleDeviceChange)
+-						manager.removeListener('UnitRemoved', handleDeviceChange)
+-						this.#removeDiskEventListeners = undefined
+-					}
+-
+-					resolve(true)
+-				})
+-		})
++		return
+ 	}
+ 
+ 	async stop() {
+-		this.logger.log('Stopping dbus')
+-		this.#removeDiskEventListeners?.()
++		return
+ 	}
+ }
+diff --git a/packages/umbreld/source/modules/files/external-storage.ts b/packages/umbreld/source/modules/files/external-storage.ts
+index 9e31d3bc..a59d97ac 100644
+--- a/packages/umbreld/source/modules/files/external-storage.ts
++++ b/packages/umbreld/source/modules/files/external-storage.ts
+@@ -58,63 +58,7 @@ export function syntheticOwnershipMountOptions(filesystemType: string, userId: n
+ // Get block devices
+ // TODO: This should probably be in a system module once we have a proper one
+ export async function getBlockDevices() {
+-	type LsBlkDevice = {
+-		name: string
+-		label?: string
+-		type?: string
+-		mountpoints?: string[]
+-		tran?: BlockDevice['transport']
+-		model?: string
+-		size?: number
+-		children?: LsBlkDevice[]
+-		parttypename?: string
+-		fstype?: string
+-		uuid?: string
+-	}
+-	const {stdout} = await $`lsblk --output-all --json --bytes`
+-	const {blockdevices} = JSON.parse(stdout) as {blockdevices: LsBlkDevice[]}
+-
+-	// Loop over block devices
+-	const externalStorageDevices: BlockDevice[] = []
+-	for (const blockDevice of blockdevices) {
+-		// Skip non-disk block devices
+-		if (blockDevice.type !== 'disk') continue
+-
+-		// Create a new external storage device
+-		const device: BlockDevice = {
+-			id: blockDevice.name,
+-			name: blockDevice.model ?? 'Untitled',
+-			transport: blockDevice.tran ?? 'unknown',
+-			size: blockDevice.size ?? 0,
+-			isMounted: false,
+-			isFormatting: false,
+-			partitions: [],
+-		}
+-
+-		// Create partitions
+-		for (const partition of blockDevice.children ?? []) {
+-			// Skip any non-partition block devices
+-			if (partition.type !== 'part') continue
+-
+-			// Add the partition to the device
+-			device.partitions.push({
+-				id: partition.name,
+-				type: partition.parttypename ?? 'unknown',
+-				filesystemType: partition.fstype ?? 'unknown',
+-				label: partition.label?.trim() ?? 'Untitled',
+-				filesystemUuid: partition.uuid?.trim() ?? '',
+-				size: partition.size ?? 0,
+-				mountpoints: partition.mountpoints?.filter(Boolean) ?? [],
+-			})
+-		}
+-
+-		device.isMounted = device.partitions.some((partition) => partition.mountpoints.length > 0)
+-
+-		// Add the device to the list
+-		externalStorageDevices.push(device)
+-	}
+-
+-	return externalStorageDevices
++	return [] as any[]
+ }
+ 
+ export default class ExternalStorage {
+@@ -131,52 +75,17 @@ export default class ExternalStorage {
+ 	}
+ 
+ 	async supported() {
+-		return true
++		return false
+ 	}
+ 
+ 	// Add listener
+ 	async start() {
+-		// Don't run through start process if we're not enabled
+-		const isEnabled = await this.supported()
+-		if (!isEnabled) return
+-
+-		this.logger.log('Starting external storage')
+-
+-		// Safely clean up any left over mount points
+-		await this.#cleanLeftOverMountPoints()
+-
+-		// Auto mount any external devices
+-		await this.#mountExternalDevices().catch((error) => {
+-			this.logger.error(`Failed to mount external devices on startup`, error)
+-		})
+-
+-		// Attach disk change listener and auto mount any new external devices
+-		this.#removeDeviceChangeListener = this.#umbreld.eventBus.on('system:disk:change', async () => {
+-			this.logger.log('Device change detected')
+-			await this.#mountExternalDevices()
+-		})
++		return
+ 	}
+ 
+ 	// Remove listener
+ 	async stop() {
+-		// Don't run through stop process if we're not enabled
+-		const isEnabled = await this.supported()
+-		if (!isEnabled) return
+-
+-		this.logger.log('Stopping external storage')
+-		this.#removeDeviceChangeListener?.()
+-
+-		// Unmount all external devices
+-		const ONE_SECOND = 1000
+-		await Promise.race([
+-			setTimeout(ONE_SECOND * 10),
+-			(async () => {
+-				this.logger.log('Unmounting all external devices')
+-				await this.#unmountAllMountedExternalDevices().catch((error) =>
+-					this.logger.error('Error unmounting external devices', error),
+-				)
+-			})(),
+-		])
++		return
+ 	}
+ 
+ 	// Mount external disks
+@@ -332,100 +241,7 @@ export default class ExternalStorage {
+ 
+ 	// Unmount partition from external disk
+ 	async unmountExternalDevice(deviceId: string, {remove = true, blockCloud = true} = {}) {
+-		// We run this through the mount queue so we don't clean up mount
+-		// points that are in the process of being mounted.
+-		// This can happen if the user unmounts a device while attaching another.
+-		return await this.#mountQueue.add(async () => {
+-			// Get mount points for block device
+-			const externalBlockDevices = await this.#getExternalDevices()
+-			const blockDevice = externalBlockDevices.find((device) => device.id === deviceId)
+-			if (!blockDevice) throw new Error('[invalid-device-id]')
+-			this.logger.log(`Unmounting device ${deviceId}`)
+-
+-			// Derive virtual mount paths for this device
+-			const externalBasePath = this.#umbreld.files.getBaseDirectory('/External')
+-			const virtualMountPaths = blockDevice.partitions
+-				.flatMap((partition) => partition.mountpoints)
+-				.filter((mountpoint) => mountpoint.startsWith(externalBasePath))
+-				.map((mountpoint) => this.#umbreld.files.systemToVirtualPath(mountpoint))
+-
+-			// The app block is registered before any async detach work so a data-root
+-			// move cannot begin after the in-use check and race the unmount.
+-			const releaseApps = await this.#umbreld.apps.blockStoragePaths(virtualMountPaths)
+-			let releaseMachines = () => {}
+-			let releaseClouds = () => {}
+-
+-			try {
+-				releaseMachines = await this.#umbreld.machines.blockStoragePaths(virtualMountPaths)
+-				releaseClouds = blockCloud
+-					? await this.#umbreld.files.cloud.blockExternalStorage(
+-							blockDevice.partitions.map((partition) => ({
+-								filesystemUuid: partition.filesystemUuid || undefined,
+-								mountPaths: partition.mountpoints
+-									.filter((mountpoint) => mountpoint.startsWith(externalBasePath))
+-									.map((mountpoint) => this.#umbreld.files.systemToVirtualPath(mountpoint)),
+-							})),
+-						)
+-					: () => {}
+-				// Exclude shares on this device from Samba before unmounting (otherwise Samba keeps the directory busy)
+-				if (virtualMountPaths.length > 0) await this.#umbreld.files.samba.applyShares({excludePaths: virtualMountPaths})
+-
+-				// Loop over partitions
+-				let failedUnmounts = false
+-				for (const partition of blockDevice.partitions) {
+-					// Skip partitions that aren't mounted
+-					if (partition.mountpoints.length == 0) continue
+-
+-					// Unmount device
+-					// We retry because `smbcontrol close-share` (from applyShares()) is fire-and-forget — it enqueues a
+-					// message to smbd which then asynchronously drains in-flight I/O before releasing file handles.
+-					// There's no synchronous wait mechanism in Samba (smbstatus polling is possible but adds fragile
+-					// JSON parsing for little gain). Retrying umount is simple and also handles non-Samba processes
+-					// (e.g. indexers) that may hold handles.
+-					this.logger.log(`Unmounting partition ${partition.id}`)
+-					await pRetry(() => $`umount --all-targets /dev/${partition.id}`, {
+-						retries: 5,
+-						minTimeout: 500,
+-						factor: 1,
+-						onFailedAttempt: (error) => {
+-							this.logger.log(
+-								`Unmount attempt ${error.attemptNumber} for ${partition.id} failed, ${error.retriesLeft} retries left`,
+-							)
+-						},
+-					}).catch((error) => {
+-						// Just log the error and continue to next partition
+-						this.logger.error(`Failed to unmount partition ${partition.id}`, error)
+-						failedUnmounts = true
+-					})
+-				}
+-
+-				// Clean up any left over mount points
+-				await this.#cleanLeftOverMountPoints()
+-
+-				// Keep a device attached if any partition is still mounted. Forcing
+-				// removal here could turn a recoverable busy mount into data loss.
+-				if (failedUnmounts) {
+-					await this.#umbreld.files.samba.applyShares().catch((error) => {
+-						this.logger.error(`Failed to restore Samba shares after an external device stayed mounted`, error)
+-					})
+-					this.#umbreld.eventBus.emit('files:external-storage:change')
+-					throw new Error('[failed-unmounts]')
+-				}
+-
+-				// Remove the block device so we don't auto mount it until it's
+-				// been removed and re-attached
+-				if (remove) await fse.writeFile(`/sys/block/${deviceId}/device/delete`, '1')
+-
+-				// Broadcast event signalling that the external storage devices have changed
+-				this.#umbreld.eventBus.emit('files:external-storage:change')
+-
+-				return true
+-			} finally {
+-				releaseClouds()
+-				releaseMachines()
+-				releaseApps()
+-			}
+-		})
++		return
+ 	}
+ 
+ 	// Format external device
+@@ -438,71 +254,7 @@ export default class ExternalStorage {
+ 		filesystem: 'ext4' | 'exfat'
+ 		label: string
+ 	}) {
+-		if (this.formatJobs.has(deviceId)) throw new Error('[format-job-already-in-progress]')
+-		this.formatJobs.add(deviceId)
+-		let releaseClouds = () => {}
+-		try {
+-			// Check valid filessytem type
+-			if (filesystem !== 'ext4' && filesystem !== 'exfat') throw new Error('[invalid-filesystem]')
+-
+-			// Check label is valid
+-			const labelSupportedCharacters = /^[A-Za-z0-9-_ ]+$/.test(label)
+-			const labelSupportedLength = label.length >= 1 && label.length <= 11
+-			const labelIsValid = labelSupportedCharacters && labelSupportedLength
+-			if (!labelIsValid) throw new Error('[invalid-label]')
+-
+-			this.logger.log(`Formatting device ${deviceId} as ${filesystem} with label ${label}`)
+-
+-			const externalBasePath = this.#umbreld.files.getBaseDirectory('/External')
+-			const blockDevice = (await this.#getExternalDevices()).find((device) => device.id === deviceId)
+-			if (blockDevice) {
+-				releaseClouds = await this.#umbreld.files.cloud.blockExternalStorage(
+-					blockDevice.partitions.map((partition) => ({
+-						filesystemUuid: partition.filesystemUuid || undefined,
+-						mountPaths: partition.mountpoints
+-							.filter((mountpoint) => mountpoint.startsWith(externalBasePath))
+-							.map((mountpoint) => this.#umbreld.files.systemToVirtualPath(mountpoint)),
+-					})),
+-				)
+-			}
+-
+-			// If the device is currently mounted, unmount it
+-			const mountedExternalDevices = await this.getMountedExternalDevices()
+-			const isDeviceMounted = mountedExternalDevices.some((device) => device.id === deviceId)
+-			if (isDeviceMounted) await this.unmountExternalDevice(deviceId, {remove: false, blockCloud: false})
+-
+-			// Clean partition table
+-			this.logger.log(`Cleaning partition table for device ${deviceId}`)
+-			await $`sgdisk --zap-all /dev/${deviceId}`
+-
+-			// Remove all filesystem signatures
+-			this.logger.log(`Removing all filesystem signatures for device ${deviceId}`)
+-			await $`wipefs -a /dev/${deviceId}`
+-
+-			// Create new partition table
+-			this.logger.log(`Creating new partition table for device ${deviceId}`)
+-			await $`parted -s /dev/${deviceId} --align optimal mklabel gpt mkpart primary ext4 0% 100%`
+-
+-			// Wait for changes
+-			this.logger.log(`Waiting for changes for device ${deviceId}`)
+-			await $`partprobe /dev/${deviceId}`
+-			await $`udevadm settle`
+-
+-			// Create filesystem
+-			if (filesystem === 'ext4') {
+-				this.logger.log(`Creating ext4 filesystem for device ${deviceId}`)
+-				await $`mkfs.ext4 -F -L ${label} /dev/${deviceId}1`
+-			} else if (filesystem === 'exfat') {
+-				this.logger.log(`Creating exfat filesystem for device ${deviceId}`)
+-				await $`mkfs.exfat -n ${label} /dev/${deviceId}1`
+-			}
+-
+-			this.logger.log(`Successfully formatted device ${deviceId} as ${filesystem} with label ${label}`)
+-			return true
+-		} finally {
+-			releaseClouds()
+-			this.formatJobs.delete(deviceId)
+-		}
++		throw new Error('External storage is not supported in Docker')
+ 	}
+ 
+ 	// Get external devices
+@@ -543,45 +295,12 @@ export default class ExternalStorage {
+ 	// Get external devices but only show mount points that are under /External
+ 	// Also decorate with useful flags like isMounted and isFormatting
+ 	async getExternalDevicesWithVirtualMountPoints() {
+-		// Get all block devices
+-		const externalBlockDevices = await this.#getExternalDevices()
+-
+-		// Loop over devices
+-		const externalBaseSystemPath = this.#umbreld.files.getBaseDirectory('/External')
+-		for (const device of externalBlockDevices) {
+-			// Loop over partitions
+-			for (const partition of device.partitions) {
+-				// Format partitions to only contain /External mount points
+-				partition.mountpoints = partition.mountpoints
+-					.filter((mountpoint) => mountpoint.startsWith(externalBaseSystemPath))
+-					.map((mountpoint) => this.#umbreld.files.systemToVirtualPath(mountpoint))
+-			}
+-
+-			// Update isMounted flag to only apply to vfs mounts
+-			device.isMounted = device.partitions.some((partition) => partition.mountpoints.length > 0)
+-
+-			// Check if we have a formatting job running for this device
+-			device.isFormatting = this.formatJobs.has(device.id)
+-		}
+-
+-		return externalBlockDevices
++		return []
+ 	}
+ 
+ 	// Get all umbreld mounted external devices
+ 	async getMountedExternalDevices() {
+-		// Get all block devices
+-		const externalBlockDevices = await this.getExternalDevicesWithVirtualMountPoints()
+-
+-		// Loop over devices
+-		for (const device of externalBlockDevices) {
+-			// Filter out partitions without mount points from device
+-			device.partitions = device.partitions.filter((partition) => partition.mountpoints.length > 0)
+-		}
+-
+-		// Filter out block devices without partitions
+-		const mountedExternalDevices = externalBlockDevices.filter((device) => device.partitions.length > 0)
+-
+-		return mountedExternalDevices
++		return []
+ 	}
+ 
+ 	// Unmount all mounted external devices
+diff --git a/packages/umbreld/source/modules/files/network-storage.ts b/packages/umbreld/source/modules/files/network-storage.ts
+index 2dee62a1..85b0b7f6 100644
+--- a/packages/umbreld/source/modules/files/network-storage.ts
++++ b/packages/umbreld/source/modules/files/network-storage.ts
+@@ -34,53 +34,21 @@ export default class NetworkStorage {
+ 	}
+ 
+ 	async start() {
+-		this.isRunning = true
+-		this.watchJobPromise = this.#watchAndMountShares().catch((error) =>
+-			this.logger.error('Error watching and mounting shares', error),
+-		)
++		this.logger.log('Network storage is disabled in Docker')
+ 	}
+ 
+ 	async stop() {
+-		this.logger.log('Stopping network storage')
+-		this.isRunning = false
+-
+-		const ONE_SECOND = 1000
+-
+-		// Wait for background job to finish
+-		if (this.watchJobPromise) {
+-			await Promise.race([
+-				setTimeout(ONE_SECOND * 10),
+-				(async () => {
+-					this.logger.log('Waiting for background job to finish')
+-					await this.watchJobPromise!.catch(() => {})
+-				})(),
+-			])
+-		}
+-
+-		// Cleanup any currently mounted shares
+-		await Promise.race([
+-			setTimeout(ONE_SECOND * 10),
+-			(async () => {
+-				this.logger.log('Unmounting shares')
+-				await this.#unmountAllShares().catch((error) => this.logger.error('Error unmounting shares', error))
+-			})(),
+-		])
++		return
+ 	}
+ 
+ 	// List all shares from the store
+ 	async getShares() {
+-		return (await this.#umbreld.store.get('files.networkStorage')) || []
++		return [] as Array<{host: string; share: string; username: string; password: string; mountPath: string}>
+ 	}
+ 
+ 	// List all shares including mount status
+ 	async getShareInfo() {
+-		const shares = await this.getShares()
+-		return shares.map(({host, share, mountPath}) => ({
+-			host,
+-			share,
+-			mountPath,
+-			isMounted: this.mountedShares.has(mountPath),
+-		}))
++		return []
+ 	}
+ 
+ 	// Constantly check if shares are mounted and if not, mount them
+@@ -226,31 +194,7 @@ export default class NetworkStorage {
+ 
+ 	// Add a new share
+ 	async addShare(newShare: Omit<NetworkShare, 'mountPath'>) {
+-		// Generate mount path
+-		const sanitize = (string: string) => string.replace(/[^a-zA-Z0-9\-\.\' \(\)]/g, '')
+-		const mountPath = `/Network/${sanitize(newShare.host)}/${sanitize(newShare.share)}`
+-
+-		// Check if the share already exists
+-		const alreadyExists = await this.getShare(mountPath)
+-			.then(() => true)
+-			.catch(() => false)
+-		if (alreadyExists) throw new Error(`Share with mount path ${mountPath} already exists`)
+-
+-		// Create share object
+-		const share: NetworkShare = {...newShare, mountPath}
+-
+-		// Check we can mount the share
+-		await this.#mountShare(share)
+-
+-		// Save new share in the store
+-		await this.#umbreld.store.getWriteLock(async ({set}) => {
+-			const shares = await this.getShares()
+-			if (shares.find((existingShare) => existingShare.mountPath === share.mountPath)) return
+-			shares.push(share)
+-			await set('files.networkStorage', shares)
+-		})
+-
+-		return share.mountPath
++		throw new Error('Network storage is not supported in Docker.')
+ 	}
+ 
+ 	// Get a share by mount path
+@@ -263,81 +207,23 @@ export default class NetworkStorage {
+ 
+ 	// Remove a share
+ 	async removeShare(sharePath: string) {
+-		const share = await this.getShare(sharePath)
+-
+-		// Register the app block before any async detach work so a data-root move
+-		// cannot begin after the in-use check and race the unmount.
+-		const releaseApps = await this.#umbreld.apps.blockStoragePaths([share.mountPath])
+-		let releaseClouds = () => {}
+-		try {
+-			releaseClouds = await this.#umbreld.files.cloud.blockNetworkStorage(share)
+-			// Attempt to unmount the share first
+-			await this.#unmountShare(share, {blockCloud: false})
+-
+-			// Remove the share from the store
+-			await this.#umbreld.store.getWriteLock(async ({set}) => {
+-				const shares = await this.getShares()
+-				const newShares = shares.filter((existingShare) => existingShare.mountPath !== sharePath)
+-				await set('files.networkStorage', newShares)
+-			})
+-
+-			return true
+-		} finally {
+-			releaseClouds()
+-			releaseApps()
+-		}
++		throw new Error('Network storage is not supported in Docker.')
+ 	}
+ 
+ 	// Discover available servers
+ 	// Used to help the user find servers if they don't already know the address
+ 	async discoverServers() {
+-		const avahiBrowse = await $`avahi-browse --resolve --terminate _smb._tcp --parsable`
+-
+-		const hostname = await getHostname().catch(() => '')
+-
+-		const servers = avahiBrowse.stdout
+-			.split('\n')
+-			// Grab mDNS domain name
+-			.map((line) => line.split(';')[6])
+-			// Filter out empty values
+-			.filter((line) => typeof line === 'string' && line !== '')
+-			// Filter out the current hostname
+-			.filter((line) => line !== `${hostname}.local`)
+-
+-		// Only return each address once
+-		return Array.from(new Set(servers))
++		return []
+ 	}
+ 
+ 	// Discover shares for a given samba server
+ 	// Used to help the user find share names if they don't already know them
+ 	async discoverSharesOnServer(host: string, username: string, password: string) {
+-		// TODO: Figure out if we can speed this up
+-		// The command usually returns data quite quickly but then hangs for like 10 seconds
+-		// and returns some weird compatibility error. Is there some way we can disable whatever
+-		// is causing the hang so we can get the command to return as soon as we have the info
+-		// we care about?
+-		const smbclient = await $`smbclient --list //${host} --user ${username} --password ${password} --grepable`
+-
+-		const shares = smbclient.stdout
+-			// Process line by line
+-			.split('\n')
+-			// Filter out any lines that don't have 3 '|' separated columns
+-			.filter((line) => line.split('|').length === 3)
+-			// Grab the second column (the share name)
+-			.map((line) => line.split('|')[1])
+-			// Filter out the IPC$ share that Samba always creates
+-			.filter((share) => share !== 'IPC$')
+-
+-		return shares
++		throw new Error('Network storage is not supported in Docker.')
+ 	}
+ 
+ 	// Checks if the given network address is an Umbrel device
+ 	async isServerAnUmbrelDevice(address: string) {
+-		try {
+-			const responseText = (await ky(`http://${address}/trpc/system.version`, {timeout: 1000}).text()) as any
+-			return responseText.toLowerCase().includes('umbrel')
+-		} catch {
+-			return false
+-		}
++		return false
+ 	}
+ }
+diff --git a/packages/umbreld/source/modules/files/samba.ts b/packages/umbreld/source/modules/files/samba.ts
+index a4ba25db..32fa3795 100644
+--- a/packages/umbreld/source/modules/files/samba.ts
++++ b/packages/umbreld/source/modules/files/samba.ts
+@@ -116,36 +116,18 @@ export default class Samba {
+ 	}
+ 
+ 	async start() {
+-		this.logger.log('Starting samba')
+-
+-		// Recreate local identities and passdb entries after an OS update, and
+-		// remove any managed identities that no longer correspond to an enabled
+-		// member. Share application is attempted even if credential repair fails.
+-		await this.applyCredentials().catch((error) => {
+-			this.logger.error('Failed to apply Samba credentials', error)
+-		})
+-		await this.applyShares().catch((error) => {
+-			this.logger.error('Failed to apply shares', error)
+-		})
++		this.logger.log('Samba is disabled in Docker')
+ 
+ 		this.#removeFileChangeListener = this.#umbreld.eventBus.on(
+ 			'files:watcher:change',
+ 			this.#handleFileChange.bind(this),
+ 		)
+-
+-		this.#removeExternalStorageChangeListener = this.#umbreld.eventBus.on('files:external-storage:change', () => {
+-			this.applyShares().catch((error) => this.logger.error('Failed to reapply shares', error))
+-		})
+ 		await this.#appDirectories.start()
+ 	}
+ 
+ 	async stop() {
+-		this.logger.log('Stopping samba')
+ 		this.#removeFileChangeListener?.()
+ 		await this.#appDirectories.stop()
+-		this.#removeExternalStorageChangeListener?.()
+-		await $`systemctl stop smbd`.catch((error) => this.logger.error('Failed to stop samba', error))
+-		await $`systemctl stop wsdd2`.catch((error) => this.logger.error('Failed to stop wsdd2', error))
+ 	}
+ 
+ 	#ownerSharePasswordFile() {
+@@ -278,48 +260,7 @@ export default class Samba {
+ 	}
+ 
+ 	async #applyCredentials() {
+-		const members = (await this.#umbreld.user.listMembers()).filter((member) => member.sambaPassword)
+-		const expectedMemberUsernames = new Set(members.map(({id}) => this.#systemUsername(id)))
+-
+-		await fse.outputFile(
+-			USERNAME_MAP_PATH,
+-			members.map(({id}) => `${this.#systemUsername(id)} = ${this.getShareUsername(id)}`).join('\n') +
+-				(members.length ? '\n' : ''),
+-			{mode: 0o600},
+-		)
+-		await fse.chmod(USERNAME_MAP_PATH, 0o600)
+-
+-		const systemUsers = await this.#systemUsers()
+-		const passdbUsers = await this.#passdbUsers()
+-		const failures: unknown[] = []
+-		await this.#applyPassword(OWNER_SAMBA_USERNAME, await this.getSharePassword()).catch((error) =>
+-			failures.push(error),
+-		)
+-
+-		for (const member of members) {
+-			const systemUsername = this.#systemUsername(member.id)
+-			try {
+-				if (!systemUsers.has(systemUsername)) {
+-					await $`useradd --system --no-create-home --shell /usr/sbin/nologin --gid umbrel ${systemUsername}`
+-					systemUsers.add(systemUsername)
+-				}
+-				await this.#applyPassword(systemUsername, member.sambaPassword!)
+-			} catch (error) {
+-				failures.push(error)
+-			}
+-		}
+-
+-		for (const systemUsername of new Set([...systemUsers, ...passdbUsers])) {
+-			if (!systemUsername.startsWith(MANAGED_MEMBER_USERNAME_PREFIX)) continue
+-			if (expectedMemberUsernames.has(systemUsername)) continue
+-			const cleanup = systemUsers.has(systemUsername)
+-				? this.#removeSystemCredential(systemUsername)
+-				: this.#removePassdbCredential(systemUsername)
+-			await cleanup.catch((error) => failures.push(error))
+-		}
+-
+-		if (failures.length === 1) throw failures[0]
+-		if (failures.length > 1) throw new AggregateError(failures, 'Failed to reconcile Samba credentials')
++		return
+ 	}
+ 
+ 	// Compatibility alias for callers that only need to refresh the historic
+@@ -329,7 +270,7 @@ export default class Samba {
+ 	}
+ 
+ 	async #applyPassword(systemUsername: string, password: string) {
+-		await $({input: `${password}\n${password}\n`})`smbpasswd -s -a ${systemUsername}`
++		return
+ 	}
+ 
+ 	#systemUsername(userId: string) {
+@@ -385,47 +326,11 @@ export default class Samba {
+ 	// changes. Disable/delete therefore terminates only the smbd workers that
+ 	// currently serve the revoked account.
+ 	async #disconnectSystemUser(systemUsername: string) {
+-		let status: Awaited<ReturnType<typeof $>>
+-		try {
+-			status = await $`smbstatus -b -u ${systemUsername}`
+-		} catch (error) {
+-			// smbstatus and smbd ship in the same Samba package. If the executable is
+-			// absent (as in unit-test/dev hosts), there cannot be a managed daemon to
+-			// revoke. Other enumeration failures fall back to restarting the daemon so
+-			// we never silently leave an authenticated root-forced session alive.
+-			if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+-			await this.#restartSambaForRevocation(error)
+-			return
+-		}
+-		const processIds = new Set(
+-			status.stdout
+-				.split('\n')
+-				.map((line) => line.trim().split(/\s+/, 1)[0])
+-				.filter((value) => /^\d+$/.test(value)),
+-		)
+-		const failures: unknown[] = []
+-		for (const processId of processIds) {
+-			try {
+-				// smbstatus returns the smbd worker serving this authenticated
+-				// connection. Samba recommends SIGTERM for a graceful worker shutdown;
+-				// there is no supported `smbcontrol shutdown` message.
+-				process.kill(Number(processId), 'SIGTERM')
+-			} catch (error) {
+-				// The worker may have exited naturally after smbstatus took its
+-				// snapshot, which is already the desired result.
+-				if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failures.push(error)
+-			}
+-		}
+-		if (failures.length) await this.#restartSambaForRevocation(new AggregateError(failures))
++		return
+ 	}
+ 
+ 	async #restartSambaForRevocation(cause: unknown) {
+-		this.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)
+-		try {
+-			await $`systemctl restart smbd`
+-		} catch (restartError) {
+-			throw new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')
+-		}
++		return
+ 	}
+ 
+ 	#shareIdentity(share: SambaShare) {
+@@ -441,11 +346,7 @@ export default class Samba {
+ 	}
+ 
+ 	async #closeResolvedShares(shares: ResolvedSambaShare[]) {
+-		for (const share of shares) {
+-			await $`smbcontrol smbd close-share ${share.sharename}`.catch((error) => {
+-				this.logger.error(`Failed to close share '${share.sharename}'`, error)
+-			})
+-		}
++		return
+ 	}
+ 
+ 	async #reconcileCredentialsAndShares() {
+@@ -464,48 +365,7 @@ export default class Samba {
+ 	}
+ 
+ 	async #applyShares({excludePaths}: {excludePaths?: string[]} = {}) {
+-		const shares = await this.#get()
+-		const enabledMemberIds = new Set(
+-			(await this.#umbreld.user.listMembers()).filter((member) => member.sambaPassword).map(({id}) => id),
+-		)
+-
+-		let config = SMB_CONFIG
+-		let activeShares = 0
+-		const resolvedShares = await this.#resolveSharenames(shares)
+-		const eligibleShares: {share: ResolvedSambaShare; systemPath: string}[] = []
+-
+-		for (const [index, share] of shares.entries()) {
+-			// A disabled, deleted, or tombstoned member must never be restored from a
+-			// stale share record, including during the startup cleanup window.
+-			if (share.userId !== OWNER_USER_ID && !enabledMemberIds.has(share.userId)) continue
+-			// smb.conf is line-oriented. Never render a legacy/corrupt record that
+-			// could inject another directive through its stored path or name.
+-			if (/[\r\n\0%]/.test(share.path) || /[\r\n\0]/.test(share.name)) continue
+-
+-			const systemPath = await this.#umbreld.files.virtualToSystemPath(share.path, share.userId).catch(() => undefined)
+-			if (!systemPath || !(await fse.pathExists(systemPath))) continue
+-			eligibleShares.push({share: resolvedShares[index]!, systemPath})
+-		}
+-
+-		const sharesToClose: ResolvedSambaShare[] = []
+-		for (const {share, systemPath} of eligibleShares) {
+-			if (excludePaths?.some((path) => share.path === path || share.path.startsWith(path + '/'))) {
+-				sharesToClose.push(share)
+-				continue
+-			}
+-
+-			config += shareConfig(share.sharename, systemPath, this.#systemUsername(share.userId))
+-			activeShares++
+-		}
+-
+-		await this.#closeResolvedShares(sharesToClose)
+-		await fse.writeFile('/etc/samba/smb.conf', config)
+-
+-		if (activeShares === 0) return await $`systemctl stop smbd`
+-
+-		await $`systemctl start smbd`
+-		await $`smbcontrol smbd reload-config`
+-		await $`systemctl start wsdd2`
++		return
+ 	}
+ 
+ 	async #preferredSharename(name: string, path: string, userId: string) {
+@@ -610,51 +470,7 @@ export default class Samba {
+ 	}
+ 
+ 	async addShare(virtualPath: string, userId: string = OWNER_USER_ID) {
+-		await this.#assertAccess(userId)
+-		virtualPath = this.#umbreld.files.normalizeVirtualPath(virtualPath)
+-		// Samba expands `%u`, `%H`, and other substitutions on the right-hand
+-		// side of `path =`. A literal percent in an exported path could therefore
+-		// redirect a share outside the directory that was authorized here.
+-		if (/[\r\n\0%]/.test(virtualPath)) throw new Error('[operation-not-allowed]')
+-		const allowedOperations = await this.#umbreld.files.getAllowedOperations(virtualPath, userId)
+-		if (!allowedOperations.includes('share')) throw new Error('[operation-not-allowed]')
+-		// This explicit ownership check is defense in depth against future changes
+-		// to advisory Files operations or owner-granted path permissions.
+-		if (userId !== OWNER_USER_ID && this.#umbreld.files.ownerOfPath(virtualPath) !== userId) {
+-			throw new Error('[operation-not-allowed]')
+-		}
+-		await this.#umbreld.files.virtualToSystemPath(virtualPath, userId)
+-
+-		this.logger.log(`Adding share for ${virtualPath} owned by ${userId}`)
+-		await this.#umbreld.store.getWriteLock(async ({get, set}) => {
+-			// Recheck access under the same lock as the insert. Otherwise a share
+-			// request that started just before disable/delete could persist a stale
+-			// record after revocation and resurrect it on a later re-enable.
+-			if (userId !== OWNER_USER_ID) {
+-				const members = (await get('members')) ?? []
+-				const member = members.find((member) => member.id === userId)
+-				if (!member || 'deleted' in member || !member.sambaPassword) throw new Error('[samba-access-disabled]')
+-			}
+-
+-			const shares = this.#normalizeShares((await get('files.shares')) ?? [])
+-			if (shares.some((share) => share.path === virtualPath && share.userId === userId)) {
+-				throw new Error('[share-already-exists]')
+-			}
+-
+-			const basename = nodePath.basename(virtualPath)
+-			let name = basename
+-			let suffix = 1
+-			while (shares.some((share) => share.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+-				suffix++
+-				name = `${basename} (${suffix})`
+-			}
+-			await set('files.shares', [...shares, {name, path: virtualPath, userId}])
+-		})
+-		this.#watcherShares.clear()
+-		await this.applyShares()
+-		this.#appDirectories.forget(virtualPath)
+-		await this.#appDirectories.refresh()
+-		return virtualPath
++		throw new Error('File sharing is not supported in Docker.')
+ 	}
+ 
+ 	async removeShare(virtualPath: string, userId: string = OWNER_USER_ID) {
+diff --git a/packages/umbreld/source/modules/files/watcher.ts b/packages/umbreld/source/modules/files/watcher.ts
+index 5ce5c34b..9c286ebd 100644
+--- a/packages/umbreld/source/modules/files/watcher.ts
++++ b/packages/umbreld/source/modules/files/watcher.ts
+@@ -80,19 +80,19 @@ export default class Watcher {
+ 
+ 		// Set system inotify limits
+ 		// https://facebook.github.io/watchman/docs/install#linux-inotify-limits
+-		this.logger.log('Setting system inotify limits')
++		// this.logger.log('Setting system inotify limits')
+ 		// How many root directories can be watched
+-		await $`sysctl fs.inotify.max_user_instances=256`.catch((error) =>
+-			this.logger.error(`Failed to set max user instances`, error),
+-		)
++		// await $`sysctl fs.inotify.max_user_instances=256`.catch((error) =>
++		// 	this.logger.error(`Failed to set max user instances`, error),
++		//)
+ 		// How many directories can be watched across all watched roots
+-		await $`sysctl fs.inotify.max_user_watches=122404`.catch((error) =>
+-			this.logger.error(`Failed to set max user watches`, error),
+-		)
++		// await $`sysctl fs.inotify.max_user_watches=122404`.catch((error) =>
++		// 	this.logger.error(`Failed to set max user watches`, error),
++		//)
+ 		// How many events can be queued (smaller number = more likely to have notification overflow)
+-		await $`sysctl fs.inotify.max_queued_events=16384`.catch((error) =>
+-			this.logger.error(`Failed to set max queued events`, error),
+-		)
++	  //await $`sysctl fs.inotify.max_queued_events=16384`.catch((error) =>
++		//	this.logger.error(`Failed to set max queued events`, error),
++		//)
+ 
+ 		await this.#setupListeners()
+ 
+@@ -120,13 +120,24 @@ export default class Watcher {
+ 				// Watch paths are internal, prevalidated roots. Resolve them
+ 				// without pretending the owner is authorized for member homes.
+ 				const systemPath = this.#umbreld.files.virtualToSystemPathUnsafe(virtualPath)
++				// Docker: the data directory is a symlink to the /data mount and Watchman refuses
++				// roots that resolve elsewhere. Watch the real path and map events back.
++				const realSystemPath = await fse.realpath(systemPath).catch(() => systemPath)
+ 				// Use the Watchman backend explicitly (always installed in umbrelOS). It avoids bugs in
+ 				// @parcel/watcher's inotify backend — https://github.com/getumbrel/umbrel/issues/2158
+ 				const subscription = await watcher.subscribe(
+-					systemPath,
+-					(error, events) => {
++					realSystemPath,
++					(error, rawEvents) => {
+ 						if (!this.#started || generation !== this.#subscriptionGeneration) return
+ 						if (error) return this.#handleWatchError(virtualPath, error)
++						const events =
++							realSystemPath === systemPath
++								? rawEvents
++								: rawEvents.map((event) =>
++										event.path === realSystemPath || event.path.startsWith(`${realSystemPath}/`)
++											? {...event, path: systemPath + event.path.slice(realSystemPath.length)}
++											: event,
++									)
+ 
+ 						// Detect the sentinel at the Parcel callback boundary. A large earlier
+ 						// batch can legitimately keep the consumer queue busy for longer than
+diff --git a/packages/umbreld/source/modules/hardware/internal-storage.ts b/packages/umbreld/source/modules/hardware/internal-storage.ts
+index b2154e9c..e4183b2d 100644
+--- a/packages/umbreld/source/modules/hardware/internal-storage.ts
++++ b/packages/umbreld/source/modules/hardware/internal-storage.ts
+@@ -180,84 +180,7 @@ async function getDevicePciSlotNumber(deviceName: string): Promise<number | unde
+ 
+ // Get all internal storage devices using lsblk and nvme commands
+ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
+-	type LsBlkDevice = {
+-		name: string
+-		model?: string
+-		serial?: string
+-		size?: number
+-		type?: string
+-		tran?: string
+-		rota?: boolean
+-	}
+-
+-	const {stdout} = await $`lsblk --output NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,ROTA --json --bytes`
+-	const {blockdevices} = JSON.parse(stdout) as {blockdevices: LsBlkDevice[]}
+-
+-	// Filter to internal disk devices by transport protocol
+-	const supportedTransports = ['nvme', 'sata']
+-	const internalBlockDevices = blockdevices.filter(
+-		(device) => device.type === 'disk' && supportedTransports.includes(device.tran ?? ''),
+-	)
+-
+-	// Fetch SMART data, device IDs, and PCIe slot numbers for all devices in parallel
+-	const devices: StorageDevice[] = await Promise.all(
+-		internalBlockDevices.map(async (device): Promise<StorageDevice> => {
+-			const devicePath = `/dev/${device.name}`
+-			const id = await getDeviceId(device.name).catch(() => undefined)
+-			const size = device.size ?? 0
+-			const isNvme = device.tran === 'nvme'
+-			const name = device.model?.trim() ?? (isNvme ? 'Unknown NVMe Device' : 'Unknown SATA Device')
+-			const model = device.model?.trim() ?? 'Unknown'
+-			const serial = device.serial?.trim() ?? 'Unknown'
+-			const roundedSize = getRoundedDeviceSize(size)
+-			const [smartData, temperatureThresholds, pciSlotNumber] = await Promise.all([
+-				getSmartData(devicePath),
+-				isNvme
+-					? getNvmeTemperatureThresholds(devicePath)
+-					: ({} as {temperatureWarning?: number; temperatureCritical?: number}),
+-				isNvme ? getDevicePciSlotNumber(device.name).catch(() => undefined) : undefined,
+-			])
+-
+-			const isSsd = isNvme || device.rota === false
+-
+-			if (isSsd) {
+-				return {
+-					type: 'ssd' as const,
+-					transport: device.tran as 'nvme' | 'sata',
+-					device: device.name,
+-					id,
+-					pciSlotNumber,
+-					name,
+-					model,
+-					serial,
+-					size,
+-					roundedSize,
+-					temperature: smartData.temperature,
+-					temperatureWarning: temperatureThresholds.temperatureWarning,
+-					temperatureCritical: temperatureThresholds.temperatureCritical,
+-					lifetimeUsed: smartData.lifetimeUsed,
+-					smartStatus: smartData.smartStatus,
+-				}
+-			}
+-
+-			return {
+-				type: 'hdd' as const,
+-				transport: 'sata' as const,
+-				device: device.name,
+-				id,
+-				name,
+-				model,
+-				serial,
+-				size,
+-				roundedSize,
+-				temperature: smartData.temperature,
+-				smartStatus: smartData.smartStatus,
+-			}
+-		}),
+-	)
+-
+-	// Sort by id
+-	return devices.sort((a, b) => (a.id ?? '').localeCompare(b.id ?? ''))
++	return []
+ }
+ 
+ export default class InternalStorage {
+@@ -271,7 +194,7 @@ export default class InternalStorage {
+ 	}
+ 
+ 	async start() {
+-		this.logger.log('Starting internal storage')
++		this.logger.log('Internal storage is disabled in Docker')
+ 	}
+ 
+ 	async stop() {
+@@ -280,29 +203,6 @@ export default class InternalStorage {
+ 
+ 	// Get all internal storage devices with their info
+ 	async getDevices(): Promise<StorageDevice[]> {
+-		let devices = await getInternalStorageDevices()
+-
+-		// Flag disks that back the running system so they're never offered as RAID storage
+-		const systemDiskNames = await getSystemDiskNames(this.#umbreld.dataDirectory)
+-		devices = devices.map((device) => ({...device, isSystemDrive: systemDiskNames.has(device.device)}))
+-
+-		// Attach slot numbers on Umbrel Pro
+-		if (await this.#umbreld.hardware.umbrelPro.isUmbrelPro()) {
+-			const ssdDevices = devices.filter((device) => device.type === 'ssd')
+-			const otherDevices = devices.filter((device) => device.type !== 'ssd')
+-			devices = [
+-				...ssdDevices.map((device) => ({
+-					...device,
+-					slot: this.#umbreld.hardware.umbrelPro.getSsdSlotFromPciSlotNumber(device.pciSlotNumber),
+-				})),
+-				...otherDevices,
+-			]
+-		}
+-
+-		// Sort by slot number if all devices have slots
+-		const haveMissingSlots = devices.some((device) => device.slot === undefined)
+-		if (!haveMissingSlots) devices.sort((a, b) => a.slot! - b.slot!)
+-
+-		return devices
++		return []
+ 	}
+ }
+diff --git a/packages/umbreld/source/modules/hardware/raid.ts b/packages/umbreld/source/modules/hardware/raid.ts
+index b032df8f..6690b48b 100644
+--- a/packages/umbreld/source/modules/hardware/raid.ts
++++ b/packages/umbreld/source/modules/hardware/raid.ts
+@@ -521,22 +521,12 @@ export default class Raid {
+ 	}
+ 
+ 	async hasConfigStore() {
+-		return await fse.pathExists(this.configStore.filePath)
++		return false
+ 	}
+ 
+ 	// Check whether the live Rugix data mount is the configured RAID dataset.
+ 	async isRunningFromRaidData(): Promise<boolean> {
+-		const poolName = await this.configStore.get('raid.poolName')
+-		if (!poolName) return false
+-
+-		const status = await this.getPoolStatus(poolName)
+-		if (!status.exists) return false
+-
+-		const {stdout} = await $`findmnt --json --mountpoint ${rugixDataMount} --output SOURCE,FSTYPE`
+-		const mountInfo = JSON.parse(stdout) as {filesystems?: Array<{source?: string; fstype?: string}>}
+-		const mount = mountInfo.filesystems?.[0]
+-
+-		return mount?.fstype === 'zfs' && mount.source === `${poolName}/data`
++		return false
+ 	}
+ 
+ 	// Generate a unique pool name with random suffix to avoid collisions
+@@ -547,87 +537,11 @@ export default class Raid {
+ 	}
+ 
+ 	async start() {
+-		this.logger.log('Starting RAID')
+-
+-		// Halve the default ZFS ARC minimum (RAM/32 -> RAM/64) to free up memory.
+-		// On a 16GB device this means 256MB instead of 512MB.
+-		// This is more conservative for umbrelOS where we may be running alongside many apps.
+-		try {
+-			const totalMemory = os.totalmem()
+-			const arcMin = Math.max(32 * 1024 * 1024, Math.floor(totalMemory / 64))
+-			await fse.writeFile('/sys/module/zfs/parameters/zfs_arc_min', String(arcMin))
+-			this.logger.log(`Set ZFS ARC min to ${prettyBytes(arcMin)}`)
+-		} catch (error) {
+-			this.logger.error('Failed to set ZFS ARC min', error)
+-		}
+-
+-		// Widen the free-memory buffer between the ARC and everything else so the ARC responds
+-		// sooner. zfs_arc_sys_free is "the target number of bytes the ARC should leave as free
+-		// memory on the system", defaulting to RAM/64 (256MB on a 16GB device). We use RAM/10
+-		// (1.6GB) so the ARC yields before kswapd starts swapping active app memory into zram.
+-		try {
+-			const totalMemory = os.totalmem()
+-			const arcSysFree = Math.max(1024 * 1024 * 1024, Math.floor(totalMemory / 10))
+-			await fse.writeFile('/sys/module/zfs/parameters/zfs_arc_sys_free', String(arcSysFree))
+-			this.logger.log(`Set ZFS ARC sys free to ${prettyBytes(arcSysFree)}`)
+-		} catch (error) {
+-			this.logger.error('Failed to set ZFS ARC sys free', error)
+-		}
+-
+-		// Exclude blocks on special vdev from l2arc since we run both l2arc and special vdev
+-		// on different partitions on the same accelerator device. There's no speedup caching
+-		// blocks in l2arc on the same device that they already live on. It just wastes l2 cache
+-		// space for no reason.
+-		try {
+-			await fse.writeFile('/sys/module/zfs/parameters/l2arc_exclude_special', '1')
+-			this.logger.log('Set ZFS l2arc_exclude_special to 1')
+-		} catch (error) {
+-			this.logger.error('Failed to set ZFS l2arc_exclude_special', error)
+-		}
+-
+-		// Start pool monitor to send realtime events
+-		// This must happen before any operations that trigger rebuild/expansion
+-		// so events are captured from the start
+-		try {
+-			this.#startPoolMonitor()
+-		} catch (error) {
+-			this.logger.error('Failed to start pool monitor', error)
+-		}
+-
+-		// Handle initial RAID setup after first boot with the new array
+-		await this.handlePostBootRaidSetupProcess().catch((error) =>
+-			this.logger.error('Failed to handle initial RAID setup boot', error),
+-		)
+-
+-		// Update the config file to match the current live RAID device paths once the
+-		// array is mounted and healthy. This also migrates old /dev/disk/by-id paths
+-		// to the new /dev/disk/by-umbrel-id scheme.
+-		await this.#updateConfigDevicePaths().catch((error) => {
+-			this.logger.error('Failed to update RAID config device paths', error)
+-		})
+-
+-		// Check if we are currently transitioning to failsafe mode and complete the migration
+-		await this.#completeFailsafeTransition().catch((error) => {
+-			this.logger.error('Failed to complete FailSafe transition:', error)
+-		})
+-
+-		// Check daily for a due scrub. The persisted deadline survives Umbreld restarts,
+-		// and a new/legacy pool gets its first scrub deadline 30 days from now.
+-		if (await this.configStore.get('raid.poolName')) {
+-			await ensureScrubSchedule({
+-				getNextScrubAt: () => this.#umbreld.store.get('raid.nextScrubAt'),
+-				scheduleNextScrub: () => this.#scheduleNextScrub(),
+-				onError: (error) =>
+-					this.logger.error('Failed to initialize the RAID scrub schedule; retrying in one day', error),
+-			})
+-			this.#startScrubScheduler()
+-		}
++		this.logger.log('RAID is disabled in Docker')
+ 	}
+ 
+ 	async stop() {
+-		this.logger.log('Stopping RAID')
+-		this.#stopPoolMonitor?.()
+-		this.#stopScrubScheduler?.()
++		return
+ 	}
+ 
+ 	async #updateConfigDevicePaths(): Promise<void> {
+@@ -742,20 +656,7 @@ export default class Raid {
+ 
+ 	// Get status of the main RAID pool with migration error if any
+ 	async getStatus() {
+-		const name = await this.configStore.get('raid.poolName')
+-		const status = await this.getPoolStatus(name)
+-
+-		return {
+-			name,
+-			...status,
+-			replace: this.replaceStatus,
+-			failsafeTransitionStatus: this.failsafeTransitionStatus,
+-			// Supress degraded state when performing failsafe transition
+-			status:
+-				this.failsafeTransitionStatus?.state === 'rebuilding' && status.status === 'DEGRADED'
+-					? 'ONLINE'
+-					: status.status,
+-		}
++		return {exists: false} as Awaited<ReturnType<Raid['getPoolStatus']>> & {migrationError?: string}
+ 	}
+ 
+ 	// Get status of a RAID pool
+@@ -793,252 +694,7 @@ export default class Raid {
+ 		rebuild?: RebuildStatus
+ 		scrub?: ScrubStatus
+ 	}> {
+-		// Get pool status from ZFS
+-		const pool = await this.#getZpoolStatus(poolName)
+-		if (!pool) return {exists: false}
+-
+-		const vdevs = Object.values(pool.vdevs)
+-		const isDataVdev = (vdev: Vdev) => vdev.class === 'normal'
+-		const dataVdevs = vdevs.filter(isDataVdev)
+-		const rootVdev = dataVdevs.find((v) => v.vdev_type === 'root')
+-		if (!rootVdev) return {exists: false}
+-
+-		// Determine RAID type from data topology only, ignoring accelerator vdev classes.
+-		const isRaidz = dataVdevs.some((v) => v.vdev_type === 'raidz')
+-		const isMirror = dataVdevs.some((v) => v.vdev_type === 'mirror')
+-		// A partial HDD transition can contain a mirror alongside unprotected root-level disks.
+-		const hasUnprotectedDataVdev = dataVdevs.some(
+-			(v) => v.parent === rootVdev.name && v.vdev_type !== 'raidz' && v.vdev_type !== 'mirror',
+-		)
+-		const raidType = (isRaidz || isMirror) && !hasUnprotectedDataVdev ? 'failsafe' : 'storage'
+-		let topology: Topology = 'stripe'
+-		if (isRaidz) topology = 'raidz'
+-		if (isMirror) topology = 'mirror'
+-
+-		// Filter vdevs by type
+-		const diskVdevs = dataVdevs.filter((v) => v.vdev_type === 'disk')
+-		const fileVdevs = dataVdevs.filter((v) => v.vdev_type === 'file')
+-		const mirrorVdevs = dataVdevs.filter((v) => v.vdev_type === 'mirror')
+-
+-		// Parse expansion progress (only relevant for failsafe/raidz mode)
+-		let expansion: ExpansionStatus | undefined
+-		if (pool.raidz_expand_stats) {
+-			const stats = pool.raidz_expand_stats
+-			const stateMap = {SCANNING: 'expanding', FINISHED: 'finished', CANCELED: 'canceled'} as const
+-			const state = stateMap[stats.state]
+-
+-			let progress: number
+-			if (state === 'finished' || state === 'canceled') {
+-				// Reset tracker when expansion ends so next expansion starts from 0
+-				this.#lastExpansionProgress = 0
+-				progress = state === 'finished' ? 100 : 0
+-			} else {
+-				// We need to do some awkward handling here because stats.to_reflow keeps growing forever and messes up the calculations.
+-				// Cap progress at 99 while expanding due to overflow bugs
+-				const rawProgress = stats.to_reflow > 0 ? Math.floor((stats.reflowed / stats.to_reflow) * 100) : 0
+-				const cappedProgress = Math.min(rawProgress, 99)
+-				// Never let progress go backwards
+-				progress = Math.max(cappedProgress, this.#lastExpansionProgress)
+-				this.#lastExpansionProgress = progress
+-			}
+-
+-			expansion = {state, progress}
+-		}
+-
+-		// Parse rebuild progress (ZFS calls this "resilver")
+-		let rebuild: RebuildStatus | undefined
+-		if (pool.scan_stats?.function === 'RESILVER') {
+-			const stats = pool.scan_stats
+-			const stateMap = {SCANNING: 'rebuilding', FINISHED: 'finished', CANCELED: 'canceled'} as const
+-			const state = stateMap[stats.state]
+-
+-			let progress: number
+-			if (state === 'finished' || state === 'canceled') {
+-				// Reset tracker when rebuild ends so next rebuild starts from 0
+-				this.#lastRebuildProgress = 0
+-				progress = state === 'finished' ? 100 : 0
+-			} else {
+-				// Calculate progress from issued vs to_examine
+-				const rawProgress = stats.to_examine > 0 ? Math.floor((stats.issued / stats.to_examine) * 100) : 0
+-				const cappedProgress = Math.min(rawProgress, 99)
+-				// Never let progress go backwards
+-				progress = Math.max(cappedProgress, this.#lastRebuildProgress)
+-				this.#lastRebuildProgress = progress
+-			}
+-
+-			rebuild = {state, progress}
+-		}
+-
+-		// Parse scrub progress and the final error count
+-		let scrub: ScrubStatus | undefined
+-		if (pool.scan_stats?.function === 'SCRUB') {
+-			const stats = pool.scan_stats
+-			const stateMap = {SCANNING: 'scrubbing', FINISHED: 'finished', CANCELED: 'canceled'} as const
+-			const state = stateMap[stats.state]
+-
+-			let progress: number
+-			if (state === 'finished' || state === 'canceled') {
+-				// Reset tracker when a scrub ends so the next scrub starts from 0
+-				this.#lastScrubProgress = 0
+-				progress = state === 'finished' ? 100 : 0
+-			} else {
+-				const rawProgress = stats.to_examine > 0 ? Math.floor((stats.issued / stats.to_examine) * 100) : 0
+-				const cappedProgress = Math.min(rawProgress, 99)
+-				// Never let progress go backwards
+-				progress = Math.max(cappedProgress, this.#lastScrubProgress)
+-				this.#lastScrubProgress = progress
+-			}
+-
+-			scrub = {state, progress, errors: stats.errors}
+-		}
+-
+-		const toDeviceId = (path: string) => path.replace('/dev/disk/by-umbrel-id/', '').replace(/-part\d+$/, '')
+-
+-		const devices = diskVdevs.map((device) => ({
+-			id: toDeviceId(device.path!),
+-			// phys_space disappears on missing/removed members but rep_dev_size remains and is
+-			// stable (same behavior the raidz totalSpace calculation relies on), so capacity
+-			// reporting doesn't lurch while a pool is degraded
+-			size: device.phys_space || device.rep_dev_size,
+-			status: device.state,
+-			readErrors: device.read_errors,
+-			writeErrors: device.write_errors,
+-			checksumErrors: device.checksum_errors,
+-		}))
+-
+-		// Calculate l2arc and special vdev sizes
+-		// l2arc is striped so we sum all partition sizes
+-		// special vdev is mirrored so we use the smallest partition size
+-		const accelerator = parsePoolAccelerator(pool)
+-		const acceleratorDevices = accelerator.devices.map(({id, status, readErrors, writeErrors, checksumErrors}) => ({
+-			id,
+-			status,
+-			readErrors,
+-			writeErrors,
+-			checksumErrors,
+-		}))
+-		const hasAccelerator = acceleratorDevices.length > 0
+-
+-		let mirrors: string[][] | undefined
+-		if (isMirror) {
+-			const membersByMirrorVdev = new Map<string, string[]>()
+-
+-			for (const diskVdev of diskVdevs) {
+-				const mirrorVdevName = diskVdev.parent
+-				if (!mirrorVdevName) continue
+-				const members = membersByMirrorVdev.get(mirrorVdevName) ?? []
+-				members.push(toDeviceId(diskVdev.path!))
+-				membersByMirrorVdev.set(mirrorVdevName, members)
+-			}
+-
+-			mirrors = mirrorVdevs
+-				.map((mirrorVdev) => (membersByMirrorVdev.get(mirrorVdev.name) ?? []).sort())
+-				.filter((mirror) => mirror.length > 0)
+-				.sort((a, b) => a.join(',').localeCompare(b.join(',')))
+-		}
+-
+-		// ZFS has an accounting bug where after raidz expansion, it uses the old parity ratio the array was created with
+-		// to calculate total usable space, used space and free space. Since most users will upgade SSDs one
+-		// at a time this means they'll start with a parity ratio of 50%. Adding a 3rd disk gives
+-		// them a parity ratio of 33%. Meaning upgrading from 2 1TB SSDs to 3 1TB SSDs they'd expect to go from
+-		// 1TB usable space and 1TB parity, to 2TB usable space and 2TB parity. However ZFS will report the old
+-		// parity ratio of 50% and incorrectly say there is 1.5TB usable space and 1.5TB parity. Even after adding more SSDs and increasing
+-		// parity ratio further, ZFS will continue to report 50%. It's very confusing and makes it appear as
+-		// though multiple TBs of storage are being lost. The used space and free space values are also incorrect
+-		// for the same reason. The expected amount of data can still be written, it's just a reporting issue.
+-		// - https://github.com/openzfs/zfs/issues/17784
+-		//
+-		// We fix this by calculating the usable space ourself by doing:
+-		//   smallest device size * (number of devices - 1 parity device)
+-		// We then take the total space and total raw allocated space (including parity overhead) reported by ZFS
+-		// and calculate the used percentage of the array. We then multiply the usable space by the used percentage to
+-		// get the actual used space.
+-		// This results in the expected usable space, used space and free space values after raidz expansion.
+-		//
+-		// One quirk of this approach is that we have the opposite accounting issue. Instead of treating all data
+-		// as using the old parity ratio, we treat all data as using the new parity ratio. When in fact there is a mix.
+-		// This means after expansion the used space will jump up as we're assuming that the raw data was using the new
+-		// higher parity ratio. So now total and available space are correct but used space is incorrect. This is much
+-		// less confusing. It will also correct itself over time. As those files are deleted or modified they'll be
+-		// re-written using the new parity ratio bringing down the used space.
+-		// For example starting with 100GB used space and upgrading from 2 devices to 3 will show ~150GB used space.
+-		// This effectively means the 100GB in the old inneficient parity ratio is taking up enough space to write 150GB
+-		// of data with the new parity ratio. Deleting this 100GB file frees up 150GB of space for new files.
+-		let totalSpace = rootVdev.total_space
+-		let usableSpace = rootVdev.def_space
+-		let usedSpace = rootVdev.alloc_space
+-		// Fix raidz fs usage calculations after raidz expansion.
+-		// Only run this logic with more than 2 devices so we don't run it during the transition which does lots of
+-		// complex file vdev replace weirdness which makes the below calculations very complex. We don't need this
+-		// if we only have two devices anyway since ZFS default reporting is reliable in that case.
+-		if (isRaidz && diskVdevs.length > 2) {
+-			// Take file vdevs into account to handle the migration pool correctly which
+-			// has a file vdev. Otherwise we can't track FailSafe transition progress since we watch
+-			// the migration pools size to calculate snapshot sync progress.
+-			let numberOfDevices = diskVdevs.length + fileVdevs.length
+-
+-			// If we're currently replacing a device, don't count it twice. We just assume there's only ever one
+-			// replacement happening at a time to keep things simple.
+-			const isReplacing = [...diskVdevs, ...fileVdevs].some((vdev) => vdev.parent?.includes('replacing'))
+-			if (isReplacing) numberOfDevices -= 1
+-
+-			// Calculate usable space based on the smallest device size and accounting for a single parity device
+-			const smallestDeviceSize = Math.min(...devices.map((d) => d.size).filter((size) => size !== undefined))
+-			usableSpace = smallestDeviceSize * (numberOfDevices - 1)
+-
+-			// ZFS doesn't update total space until the end of a raidz1 expansion which breaks our calculations.
+-			// We need to calculate it as soon as we start a resize by summing all the devices.
+-			// We need to use phys_space because rep_dev_size can randomly change during operations.
+-			// However sometimes on missing devices phys_space doesn't exist but rep_dev_size does, and in those
+-			// situations it's stable so we can rely on it.
+-			// If we're replacing a device we skip the missing one so we don't count it twice.
+-			totalSpace = [...diskVdevs, ...fileVdevs]
+-				.filter((vdev) => !(vdev.state === 'CANT_OPEN' && vdev.parent?.includes('replacing')))
+-				.reduce((sum, vdev) => sum + (vdev.phys_space || vdev.rep_dev_size || 0), 0)
+-
+-			// Now we need to also fix usedSpace calculations otherwise we'll go negative
+-			// with the smaller usable space value.
+-			// The used space percentage is reliable from (alloc / total)
+-			// so we can multiply usableSpace by the percentage
+-			const usedPercentage = rootVdev.alloc_space / totalSpace
+-			usedSpace = Math.ceil(usableSpace * usedPercentage)
+-
+-			// TODO: Handle FailSafe replace with old devices online
+-
+-			// TODO: Handle mixed size devices
+-		}
+-
+-		// Handle raidz failsafe mode with 2 disks (or 1 disk and 1 file) reporting double usage due to
+-		// the parity device being included in the total space.
+-		if (isRaidz && diskVdevs.length <= 2) usedSpace /= 2
+-
+-		// Fix mirror space reporting. ZFS reports total_space and def_space as the usable capacity
+-		// (already accounting for mirror redundancy), so totalSpace needs to be calculated from
+-		// physical device sizes to represent the raw total capacity across all devices.
+-		if (isMirror) totalSpace = devices.reduce((sum, device) => sum + (device.size ?? 0), 0)
+-
+-		return {
+-			exists: true,
+-			raidType,
+-			topology,
+-			totalSpace,
+-			usableSpace,
+-			usedSpace,
+-			freeSpace: usableSpace - usedSpace,
+-			status: pool.state,
+-			dataErrors: pool.error_count,
+-			devices,
+-			mirrors,
+-			accelerator: {
+-				exists: hasAccelerator,
+-				l2arcSize: accelerator.totalL2arcSize,
+-				specialSize: accelerator.totalSpecialUsableSize,
+-				devices: acceleratorDevices,
+-			},
+-			expansion,
+-			rebuild,
+-			scrub,
+-		}
++		return {exists: false}
+ 	}
+ 
+ 	#assertNoScrubInProgress(pool: Awaited<ReturnType<Raid['getStatus']>>, operation: string): void {
+@@ -1071,39 +727,7 @@ export default class Raid {
+ 
+ 	// Start a scrub and let the pool monitor report progress and completion.
+ 	async scrub(): Promise<boolean> {
+-		const pool = await this.getStatus()
+-		if (!pool.exists) throw new Error("RAID array doesn't exist")
+-
+-		if (this.#isStartingScrub) throw new Error('A RAID scrub is already in progress')
+-		const conflict = getScrubConflict({
+-			isInitialSetupInProgress: this.isInitialSetupInProgress,
+-			isTransitioningToFailsafe: this.isTransitioningToFailsafe,
+-			isReplacing: this.isReplacing,
+-			activePoolMutation: this.#activePoolMutation,
+-			expansion: pool.expansion,
+-			rebuild: pool.rebuild,
+-			scrub: pool.scrub,
+-		})
+-		if (conflict === 'scrub') throw new Error('A RAID scrub is already in progress')
+-		if (conflict) throw new Error(`Cannot start a RAID scrub while ${conflict} is in progress`)
+-
+-		this.#isStartingScrub = true
+-		try {
+-			this.logger.log(`Starting scrub of RAID pool '${pool.name}'`)
+-			await $`zpool scrub ${pool.name}`
+-		} finally {
+-			this.#isStartingScrub = false
+-		}
+-		await this.#scheduleNextScrub().catch((error) =>
+-			this.logger.error('Failed to persist the next RAID scrub deadline', error),
+-		)
+-
+-		const scrub: ScrubStatus = {state: 'scrubbing', progress: 0, errors: 0}
+-		this.#lastScrubProgress = 0
+-		this.#lastEmittedScrub = scrub
+-		this.#hasObservedScrub = true
+-		this.#umbreld.eventBus.emit('raid:scrub-progress', scrub)
+-		return true
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #getZpoolStatus(poolName: string): Promise<Pool | undefined> {
+@@ -1123,115 +747,35 @@ export default class Raid {
+ 		acceleratorDevices: string[] | undefined,
+ 		user: {name: string; password: string; language: string},
+ 	) {
+-		if (this.isInitialSetupInProgress) throw new Error('Initial RAID setup is already in progress')
+-		this.isInitialSetupInProgress = true
+-
+-		try {
+-			// Setup the RAID array and optional accelerator before rebooting into it.
+-			await this.setup(raidDevices, raidType, acceleratorDevices)
+-
+-			// Temporarily store the user setup details. We create the user on the next boot.
+-			await this.configStore.set('user', user)
+-
+-			// Keep the guard set until reboot so registration cannot start setup again in
+-			// the gap between this response and the process exiting.
+-			setTimeout(1000)
+-				.then(() => reboot())
+-				.catch((error) => {
+-					this.isInitialSetupInProgress = false
+-					this.logger.error('Failed to reboot after initial RAID setup', error)
+-				})
+-
+-			return true
+-		} catch (error) {
+-			this.isInitialSetupInProgress = false
+-			throw error
+-		}
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	// Handle initial RAID setup after first boot with the new array
+ 	async handlePostBootRaidSetupProcess() {
+-		// Check if we're on the first boot after RAID setup
+-		const raidConfigUser = await this.configStore.get('user')
+-		const userExists = await this.#umbreld.user.exists()
+-		if (raidConfigUser?.name && raidConfigUser?.password && !userExists) {
+-			this.logger.log('Detected first boot after RAID setup, creating user')
+-			try {
+-				// Create the user which will also update user/hashedPassword in the RAID config
+-				await this.#umbreld.user.register(raidConfigUser.name, raidConfigUser.password, raidConfigUser.language ?? 'en')
+-
+-				// Wipe the plain text password from the RAID config
+-				await this.configStore
+-					.delete('user.password')
+-					.catch((error) => this.logger.error('Failed to delete password from RAID config', error))
+-			} catch (error) {
+-				this.logger.error('Failed to create user', error)
+-				// If this fails we save the error to return over the API to the UI
+-				this.initialRaidSetupError = error as Error
+-			}
+-		}
++		return
+ 	}
+ 
+ 	// Check the status of the RAID setup boot process
+ 	async checkInitialRaidSetupStatus(): Promise<boolean> {
+-		// Throw error if we failed to create the user
+-		if (this.initialRaidSetupError) throw this.initialRaidSetupError
+-
+-		// Return false if the RAID array doesn't exist yet
+-		const pool = await this.getStatus()
+-		if (!pool.exists) return false
+-
+-		// Return false if the user isn't created yet
+-		const userExists = await this.#umbreld.user.exists()
+-		if (!userExists) return false
+-
+-		// Return false if the app store hasn't attempted to complete it's initial sync yet
+-		if (!this.#umbreld.appStore.attemptedInitialAppStoreUpdate) return false
+-
+-		// Initial RAID setup is complete
+-		return true
++		return false
+ 	}
+ 
+ 	// Check if RAID mount failed during boot
+ 	async checkRaidMountFailure(): Promise<boolean> {
+-		return fse.pathExists('/run/rugix/mounts/data/.rugix/data-mount-error.log')
++		return false
+ 	}
+ 
+ 	// Get details about why RAID mount failed by running a test import
+ 	async checkRaidMountFailureDevices(): Promise<Array<{name: string; isOk: boolean}>> {
+-		const {stdout} = await $`zpool import -N -d /dev/disk/by-umbrel-id`
+-		const expectedDevices = ((await this.configStore.get('raid.devices')) ?? []) as string[]
+-
+-		return expectedDevices.map((device) => {
+-			const name = device.replace('/dev/disk/by-umbrel-id/', '')
+-			const isOk = stdout.split('\n').some((line) => line.includes(name) && line.includes('ONLINE'))
+-			return {name, isOk}
+-		})
++		return []
+ 	}
+ 
+ 	async hasRecoverableInstall(): Promise<boolean> {
+-		if (await this.#umbreld.user.exists()) return false
+-		return (await this.#getRecoverableInstall()) !== undefined
++		return false
+ 	}
+ 
+ 	async recoverExistingInstall(): Promise<boolean> {
+-		if (await this.#umbreld.user.exists()) return false
+-
+-		try {
+-			const install = await this.#getRecoverableInstall()
+-			if (!install) return false
+-
+-			const restored = await this.#restoreBootConfigFromRecoverableInstall(install)
+-			if (!restored) return false
+-
+-			setSystemStatus('restarting')
+-			setTimeout(1000).then(() => reboot())
+-
+-			return true
+-		} catch (error) {
+-			this.logger.error('Failed to recover existing RAID install', error)
+-			return false
+-		}
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #getRecoverableInstall(): Promise<string | undefined> {
+@@ -1488,7 +1032,7 @@ export default class Raid {
+ 	// 2. Create a ZFS pool from all data partitions
+ 	// 3. Write RAID config to boot partition to signal the boot process to mount the array
+ 	async setup(deviceIds: string[], raidType: RaidType, acceleratorDeviceIds?: string[]): Promise<boolean> {
+-		return this.#withPoolMutation('RAID setup', () => this.#setup(deviceIds, raidType, acceleratorDeviceIds))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #setup(deviceIds: string[], raidType: RaidType, acceleratorDeviceIds?: string[]): Promise<boolean> {
+@@ -1635,7 +1179,7 @@ export default class Raid {
+ 	// Add one device to a stripe (storage) or raidz (failsafe SSD) array.
+ 	// Mirror failsafe arrays must use addMirror().
+ 	async addDevice(deviceId: string): Promise<boolean> {
+-		return this.#withPoolMutation('RAID device addition', () => this.#addDevice(deviceId))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #addDevice(deviceId: string): Promise<boolean> {
+@@ -1686,7 +1230,7 @@ export default class Raid {
+ 
+ 	// Add one mirror pair to a mirror (failsafe HDD) array.
+ 	async addMirror(deviceIds: [string, string]): Promise<boolean> {
+-		return this.#withPoolMutation('RAID mirror addition', () => this.#addMirror(deviceIds))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #addMirror(deviceIds: [string, string]): Promise<boolean> {
+@@ -1749,7 +1293,7 @@ export default class Raid {
+ 	// bulk data on HDDs. On a 2TB Umbrel dataset this is ~15GB. 64k would jump to ~150GB which is
+ 	// unpredictable on larger/different workloads, so we stay conservative.
+ 	async addAccelerator(deviceIds: string[]): Promise<boolean> {
+-		return this.#withPoolMutation('RAID accelerator addition', () => this.#addAccelerator(deviceIds))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #addAccelerator(deviceIds: string[]): Promise<boolean> {
+@@ -1974,7 +1518,7 @@ export default class Raid {
+ 
+ 	// Replace a storage or accelerator device in the RAID array.
+ 	async replaceDevice(oldDeviceId: string, newDeviceId: string): Promise<boolean> {
+-		return this.#withPoolMutation('device replacement', () => this.#replaceDevice(oldDeviceId, newDeviceId))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #replaceDevice(oldDeviceId: string, newDeviceId: string): Promise<boolean> {
+@@ -2023,7 +1567,7 @@ export default class Raid {
+ 	// Transition an SSD storage array to a failsafe (raidz1) array.
+ 	// This creates a degraded raidz1 pool with the new disk and syncs data from the old pool.
+ 	async transitionToFailsafeRaidz(newDeviceId: string): Promise<boolean> {
+-		return this.#withPoolMutation('FailSafe transition', () => this.#transitionToFailsafeRaidz(newDeviceId))
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #transitionToFailsafeRaidz(newDeviceId: string): Promise<boolean> {
+@@ -2200,9 +1744,7 @@ export default class Raid {
+ 		pairs: FailsafeMirrorTransitionPair[],
+ 		acceleratorDeviceId?: string,
+ 	): Promise<boolean> {
+-		return this.#withPoolMutation('FailSafe transition', () =>
+-			this.#transitionToFailsafeMirror(pairs, acceleratorDeviceId),
+-		)
++		throw new Error('RAID management is not supported in Docker.')
+ 	}
+ 
+ 	async #transitionToFailsafeMirror(
+diff --git a/packages/umbreld/source/modules/hardware/thunderbolt.ts b/packages/umbreld/source/modules/hardware/thunderbolt.ts
+index b4437e37..3a93cdb2 100644
+--- a/packages/umbreld/source/modules/hardware/thunderbolt.ts
++++ b/packages/umbreld/source/modules/hardware/thunderbolt.ts
+@@ -106,7 +106,22 @@ export async function discoverThunderboltDevices(devicesPath = THUNDERBOLT_DEVIC
+ }
+ 
+ const setDeviceAuthorization = async (authorizedPath: string, authorized: boolean) => {
+-	await fse.writeFile(authorizedPath, authorized ? '1' : '0')
++	try {
++		await fse.writeFile(authorizedPath, authorized ? '1' : '0')
++	} catch (error) {
++		// Docker: /sys is read-only unless the container is privileged
++		if ((error as NodeJS.ErrnoException).code === 'EROFS') {
++			throw new Error('Authorizing Thunderbolt devices requires running the Umbrel container with privileged: true')
++		}
++		throw error
++	}
++}
++
++// Docker: udevadm is only useful when the container shares the host's udev
++// (network_mode: host and /run/udev mounted). Without it, rely on periodic scans.
++const isUdevAvailable = async () => {
++	const result = await execa('udevadm', ['--version'], {reject: false})
++	return result.exitCode === 0
+ }
+ 
+ const startEventMonitor = (onEvent: () => Promise<void>): ThunderboltEventMonitor => {
+@@ -178,10 +193,22 @@ export default class Thunderbolt {
+ 
+ 	async start() {
+ 		if (this.#monitorAbortController) return
++
++		// Docker: the kernel only exposes this bus on hosts with a Thunderbolt
++		// controller (never on Docker Desktop), and the controller is built in.
++		if (!(await fse.pathExists(this.#devicesPath))) {
++			this.logger.log('No Thunderbolt controller found, authorization monitor disabled')
++			return
++		}
++
+ 		this.logger.log('Starting Thunderbolt authorization monitor')
+ 		const abortController = new AbortController()
+ 		this.#monitorAbortController = abortController
+-		this.#eventMonitorLoopPromise = this.#eventMonitorLoop(abortController.signal)
++		if (this.#startEventMonitor !== startEventMonitor || (await isUdevAvailable())) {
++			this.#eventMonitorLoopPromise = this.#eventMonitorLoop(abortController.signal)
++		} else {
++			this.logger.log(`udev is unavailable, scanning for Thunderbolt devices every ${this.#scanIntervalMs / 1000}s`)
++		}
+ 		this.reconcile().catch((error) => this.logger.error('Failed to scan for Thunderbolt devices', error))
+ 		this.#scanLoopPromise = this.#scanLoop(abortController.signal)
+ 	}
+diff --git a/packages/umbreld/source/modules/is-umbrel-home.ts b/packages/umbreld/source/modules/is-umbrel-home.ts
+index 1ce8a2b5..483f49ab 100644
+--- a/packages/umbreld/source/modules/is-umbrel-home.ts
++++ b/packages/umbreld/source/modules/is-umbrel-home.ts
+@@ -2,11 +2,5 @@ import fse from 'fs-extra'
+ import systeminfo from 'systeminformation'
+ 
+ export default async function isUmbrelHome() {
+-	// This file exists in old versions of amd64 Umbrel OS builds due to the Docker build system.
+-	// It confuses the systeminfo library and makes it return the model as 'Docker Container'.
+-	await fse.remove('/.dockerenv')
+-
+-	const {manufacturer, model} = await systeminfo.system()
+-
+-	return manufacturer === 'Umbrel, Inc.' && model === 'Umbrel Home'
++	return false
+ }
+diff --git a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
+index 67bc18f7..167afde0 100644
+--- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
++++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
+@@ -22,6 +22,15 @@ import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-ga
+ 
+ const NFT_BIN = '/usr/sbin/nft'
+ 
++// Docker: umbreld runs in a container on umbrel_main_network. It cannot program the
++// host firewall and Docker cannot publish new ports on a running container, so every
++// app port is published by a small relay container forwarding to the same port on the
++// Umbrel container, where the app mux listens directly (no hidden port, no nftables).
++const DOCKER_CONTAINER_NAME = process.env.UMBREL_CONTAINER_NAME
++const DOCKER_RELAY_LABEL = 'com.umbrel.lan-ingress'
++const DOCKER_RELAY_NETWORK = 'umbrel_main_network'
++const DOCKER_RELAY_IMAGE = process.env.UMBREL_INGRESS_RELAY_IMAGE || 'alpine/socat:latest'
++
+ // This table contains only Umbrel-owned LAN ingress rules. App ports stay
+ // owned by apps; nftables redirects inbound LAN traffic to hidden Node listeners.
+ const NFT_TABLE_NAME = 'umbrel_lan_ingress'
+@@ -201,6 +210,12 @@ export default class LanIngress {
+ 			this.logger.error('Failed to finish LAN ingress refresh before stop', error),
+ 		)
+ 		await this.closeAllServers()
++		if (DOCKER_CONTAINER_NAME) {
++			await this.reconcileDockerRelays([]).catch((error) =>
++				this.logger.error('Failed to remove LAN ingress relay containers', error),
++			)
++			return
++		}
+ 		await this.applyNftRuleset([]).catch((error) =>
+ 			this.logger.error('Failed to clear LAN ingress nftables rules', error),
+ 		)
+@@ -336,6 +351,11 @@ export default class LanIngress {
+ 		await this.ensureServerCertificate(sans)
+ 
+ 		const nextAppRoutes = this.removeConflictingAppRoutes(await this.getAppRoutes(sans.dns))
++		if (DOCKER_CONTAINER_NAME) {
++			await this.updateListeners(nextAppRoutes)
++			await this.reconcileDockerRelays(nextAppRoutes)
++			return
++		}
+ 		const currentAppRoutes = [...this.#appMuxServers.values()].map((entry) => entry.route)
+ 		const guardedPortMappings = this.mergePortMappingsByHiddenPort(currentAppRoutes, nextAppRoutes)
+ 		// Hidden Node listeners bind on wildcard addresses so nftables can redirect LAN
+@@ -564,6 +584,9 @@ export default class LanIngress {
+ 
+ 	private async getAppRoutes(reservedHostnames: string[]): Promise<AppIngressRoute[]> {
+ 		const {routes, reservedPorts} = await this.getAppIngressCandidates(reservedHostnames)
++		if (DOCKER_CONTAINER_NAME) {
++			return routes.filter((route) => route.gateway).map((route) => ({...route, hiddenPort: route.publicPort}))
++		}
+ 		const allocations = this.allocateAppIngressPorts(routes, reservedPorts)
+ 		return routes.map((route) => ({...route, hiddenPort: allocations[route.id].hiddenPort}))
+ 	}
+@@ -897,6 +920,7 @@ export default class LanIngress {
+ 	private async ensureAppLoopbackServer(entry: AppMuxServer) {
+ 		// Directly published and host-network apps already own their listeners.
+ 		if (!entry.gatewayServer || entry.loopbackServer) return
++		if (DOCKER_CONTAINER_NAME) return
+ 		const server = this.createMuxServer({
+ 			listenPort: entry.route.publicPort,
+ 			httpPort: this.serverPort(entry.gatewayServer),
+@@ -1224,6 +1248,52 @@ export default class LanIngress {
+ 		activeSockets.clear()
+ 	}
+ 
++	// Docker: make sure exactly one relay container publishes each app port on the host.
++	// The label records the forwarding target so a changed route recreates its relay.
++	private async reconcileDockerRelays(routes: AppIngressRoute[]) {
++		const format = `{{.Names}}\t{{.State}}\t{{.Label "${DOCKER_RELAY_LABEL}"}}`
++		const {stdout} = await $`docker ps --all --filter label=${DOCKER_RELAY_LABEL} --format ${format}`
++		const existing = new Map(
++			stdout
++				.split('\n')
++				.filter(Boolean)
++				.map((line) => {
++					const [name, state, spec] = line.split('\t')
++					return [name, {state, spec}] as const
++				}),
++		)
++
++		const desired = new Map(
++			routes.map((route) => [
++				`umbrel_ingress_${route.id}`,
++				{route, spec: `${route.publicPort}:${DOCKER_CONTAINER_NAME}:${route.hiddenPort}`},
++			]),
++		)
++
++		for (const [name, {state, spec}] of existing) {
++			const wanted = desired.get(name)
++			if (wanted && wanted.spec === spec && state === 'running') continue
++			await $({reject: false})`docker rm --force ${name}`
++			existing.delete(name)
++		}
++
++		for (const [name, {route, spec}] of desired) {
++			if (existing.has(name)) continue
++			try {
++				await $`docker run --detach --name ${name} --label ${`${DOCKER_RELAY_LABEL}=${spec}`} --network ${DOCKER_RELAY_NETWORK} --restart unless-stopped --publish ${`${route.publicPort}:${route.publicPort}`} ${DOCKER_RELAY_IMAGE} TCP-LISTEN:${route.publicPort},fork,reuseaddr TCP:${DOCKER_CONTAINER_NAME}:${route.hiddenPort}`
++				this.logger.log(`Published port ${route.publicPort} for ${route.id}`)
++			} catch (error) {
++				// Docker leaves a created-but-not-started container behind on port conflicts
++				await $({reject: false})`docker rm --force ${name}`
++				const details = `${(error as {stderr?: string}).stderr ?? ''} ${(error as Error).message}`
++				const message = /port is already allocated|address already in use/i.test(details)
++					? `Port ${route.publicPort} is already in use on the Docker host`
++					: 'Failed to start the relay container'
++				this.logger.error(`Failed to publish port ${route.publicPort} for ${route.id}: ${message}`, error)
++			}
++		}
++	}
++
+ 	private async closeAllServers() {
+ 		for (const wait of this.#appGatewayWaits.values()) wait.controller.abort()
+ 		this.#appGatewayWaits.clear()
+@@ -1255,6 +1325,7 @@ export default class LanIngress {
+ 		redirectRoutes: IngressPortMapping[],
+ 		hiddenPortRoutes: IngressPortMapping[] = redirectRoutes,
+ 	) {
++		if (DOCKER_CONTAINER_NAME) return
+ 		const nftRuleset = this.buildNftRuleset(redirectRoutes, hiddenPortRoutes)
+ 		await $({input: nftRuleset})`${NFT_BIN} -f -`
+ 	}
+diff --git a/packages/umbreld/source/modules/machines/domain.ts b/packages/umbreld/source/modules/machines/domain.ts
+index 4d26ea18..9538d509 100644
+--- a/packages/umbreld/source/modules/machines/domain.ts
++++ b/packages/umbreld/source/modules/machines/domain.ts
+@@ -249,7 +249,11 @@ export function buildDomainXml({
+   <on_poweroff>destroy</on_poweroff>
+   <on_reboot>restart</on_reboot>
+   <on_crash>restart</on_crash>
+-  <seclabel type='dynamic' model='apparmor' relabel='yes'/>
++  ${
++		// Docker: libvirt cannot load AppArmor profiles from inside a container, so
++		// rely on its default DAC driver (QEMU runs as the unprivileged libvirt-qemu)
++		process.env.UMBREL_CONTAINER_NAME ? '' : `<seclabel type='dynamic' model='apparmor' relabel='yes'/>`
++	}
+   <devices>
+     <emulator>${emulator}</emulator>
+     <disk type='file' device='disk'>
+@@ -265,7 +269,14 @@ export function buildDomainXml({
+ 			<mac address='${escapeXml(definition.macAddress)}'/>
+ 			<source network='${MACHINE_NETWORK_NAME}'/>
+ 			<port isolated='yes'/>
+-			<filterref filter='clean-traffic'><parameter name='IP' value='${escapeXml(definition.ipAddress)}'/></filterref>
++			${
++				// Docker: kernels without bridge netfilter (Docker Desktop's WSL2) cannot
++				// run libvirt's ebtables-based filters. Port isolation and the guest_cross
++				// rule still keep machines apart; only anti-spoofing is lost.
++				process.env.UMBREL_MACHINES_NO_NWFILTER
++					? ''
++					: `<filterref filter='clean-traffic'><parameter name='IP' value='${escapeXml(definition.ipAddress)}'/></filterref>`
++			}
+ 			<model type='${networkModel}'/>
+ 			${networkDriver}
+ 			${networkAddress}
+diff --git a/packages/umbreld/source/modules/machines/libvirt.ts b/packages/umbreld/source/modules/machines/libvirt.ts
+index c5eec189..5a5ded7e 100644
+--- a/packages/umbreld/source/modules/machines/libvirt.ts
++++ b/packages/umbreld/source/modules/machines/libvirt.ts
+@@ -47,6 +47,14 @@ export const MACHINE_SHORT_CONTROL_TIMEOUT_MS = 30_000
+ export const QEMU_GIBIBYTE_BYTES = 1_024 ** 3
+ const MOUNTPOINT_NOT_MOUNTED_EXIT_CODE = 32
+ 
++// Docker: libvirt runs inside the Umbrel container. Port forwards reach it
++// through relay containers that publish each port on the Docker host.
++const DOCKER_CONTAINER_NAME = process.env.UMBREL_CONTAINER_NAME
++const DOCKER_CONTAINER_IP = process.env.UMBREL_CONTAINER_IP
++const DOCKER_RELAY_LABEL = 'com.umbrel.machine-port'
++const DOCKER_RELAY_NETWORK = 'umbrel_main_network'
++const DOCKER_RELAY_IMAGE = process.env.UMBREL_INGRESS_RELAY_IMAGE || 'alpine/socat:latest'
++
+ export function audioDevicesForSlot(slot: number) {
+ 	if (!Number.isInteger(slot) || slot < 0 || slot >= AUDIO_SLOT_COUNT) throw new Error('[machine-audio-slot-invalid]')
+ 	const card = Math.floor(slot / AUDIO_SUBSTREAMS_PER_CARD)
+@@ -228,7 +236,19 @@ export default class Libvirt {
+ 		this.logger = umbreld.logger.createChildLogger('libvirt')
+ 	}
+ 
++	#disabledLogged = false
++
+ 	async probe() {
++		// Docker: the entrypoint only starts libvirt when the container can run it
++		const disabledReason = process.env.UMBREL_MACHINES_DISABLED
++		if (disabledReason) {
++			this.available = false
++			this.kvmAvailable = false
++			if (!this.#disabledLogged) this.logger.log(`Machines are disabled: ${disabledReason}`)
++			this.#disabledLogged = true
++			return {available: this.available, kvmAvailable: this.kvmAvailable}
++		}
++
+ 		this.kvmAvailable = await fse
+ 			.stat('/dev/kvm')
+ 			.then((stat) => stat.isCharacterDevice())
+@@ -332,6 +352,13 @@ export default class Libvirt {
+ 	}
+ 
+ 	async #lanInterface() {
++		// Docker: forwarded traffic arrives from the relays on Umbrel's bridge network
++		if (DOCKER_CONTAINER_IP) {
++			const {stdout} = await execa('ip', ['-json', '-4', 'address', 'show'])
++			const links = JSON.parse(stdout) as Array<{ifname: string; addr_info?: Array<{local?: string}>}>
++			return links.find((link) => link.addr_info?.some(({local}) => local === DOCKER_CONTAINER_IP))?.ifname
++		}
++
+ 		const {stdout} = await execa('ip', ['-json', 'route', 'show', 'default'])
+ 		const routes = JSON.parse(stdout) as DefaultRoute[]
+ 		return routes.sort((a, b) => (a.metric ?? 0) - (b.metric ?? 0)).find((route) => route.dev)?.dev
+@@ -346,11 +373,24 @@ export default class Libvirt {
+ 		if (needsLan && !lanInterface) throw new Error('[machine-lan-interface-unavailable]')
+ 
+ 		await execa('nft', ['delete', 'table', 'ip', 'umbrel_machines'], {reject: false, timeout: 10_000})
++		let portForwardRules = buildMachinePortForwardNftables(definitions, lanInterface)
++		// Docker: some kernels (Docker Desktop's WSL2) lack the nftables fib
++		// expression. Relayed traffic is always addressed to the container itself.
++		if (DOCKER_CONTAINER_IP) {
++			portForwardRules = portForwardRules.replaceAll('fib daddr type local', `ip daddr ${DOCKER_CONTAINER_IP}`)
++		}
+ 		await execa('nft', ['-f', '-'], {
+-			input: buildMachinePortForwardNftables(definitions, lanInterface),
++			input: portForwardRules,
+ 			timeout: 10_000,
+ 		})
+ 
++		// Docker: the container has its own network namespace without Docker's
++		// DOCKER-USER chain. Create an unhooked one so the managed rules have a home.
++		if (DOCKER_CONTAINER_NAME) {
++			await execa('nft', ['add', 'table', 'ip', 'filter'], {timeout: 10_000})
++			await execa('nft', ['add', 'chain', 'ip', 'filter', 'DOCKER-USER'], {timeout: 10_000})
++		}
++
+ 		await this.#removeManagedNftRules('filter', 'DOCKER-USER')
+ 		await this.#removeManagedNftRules('libvirt_network', 'guest_input')
+ 		await this.#removeManagedNftRules('libvirt_network', 'guest_cross')
+@@ -400,9 +440,88 @@ export default class Libvirt {
+ 			],
+ 			{timeout: 10_000},
+ 		)
++		if (DOCKER_CONTAINER_NAME) await this.#reconcileDockerRelays(forwards)
+ 		this.#nextFirewallCheckAt = Date.now() + 5_000
+ 	}
+ 
++	// Docker: make sure exactly one relay container publishes each forwarded port
++	// on the Docker host and sends it to the Umbrel container, where the nftables
++	// rules above forward it to the machine. The label records the target so a
++	// changed forward recreates its relay.
++	async #reconcileDockerRelays(forwards: Array<{protocol: 'tcp' | 'udp'; hostPort: number}>) {
++		try {
++			const format = `{{.Names}}\t{{.State}}\t{{.Label "${DOCKER_RELAY_LABEL}"}}`
++			const {stdout} = await execa(
++				'docker',
++				['ps', '--all', '--filter', `label=${DOCKER_RELAY_LABEL}`, '--format', format],
++				{timeout: 30_000},
++			)
++			const existing = new Map(
++				stdout
++					.split('\n')
++					.filter(Boolean)
++					.map((line) => {
++						const [name, state, spec] = line.split('\t')
++						return [name, {state, spec}] as const
++					}),
++			)
++			const desired = new Map(
++				forwards.map((forward) => [
++					`umbrel_machine_${forward.protocol}_${forward.hostPort}`,
++					{forward, spec: `${forward.protocol}:${forward.hostPort}:${DOCKER_CONTAINER_NAME}`},
++				]),
++			)
++
++			for (const [name, {state, spec}] of existing) {
++				const wanted = desired.get(name)
++				if (wanted && wanted.spec === spec && state === 'running') continue
++				await execa('docker', ['rm', '--force', name], {reject: false, timeout: 30_000})
++				existing.delete(name)
++			}
++
++			for (const [name, {forward, spec}] of desired) {
++				if (existing.has(name)) continue
++				const {protocol, hostPort} = forward
++				const socat =
++					protocol === 'udp'
++						? [`UDP-LISTEN:${hostPort},fork,reuseaddr`, `UDP:${DOCKER_CONTAINER_NAME}:${hostPort}`]
++						: [`TCP-LISTEN:${hostPort},fork,reuseaddr`, `TCP:${DOCKER_CONTAINER_NAME}:${hostPort}`]
++				const result = await execa(
++					'docker',
++					[
++						'run',
++						'--detach',
++						'--name',
++						name,
++						'--label',
++						`${DOCKER_RELAY_LABEL}=${spec}`,
++						'--network',
++						DOCKER_RELAY_NETWORK,
++						'--restart',
++						'unless-stopped',
++						'--publish',
++						`${hostPort}:${hostPort}/${protocol}`,
++						DOCKER_RELAY_IMAGE,
++						...socat,
++					],
++					{reject: false, timeout: 120_000},
++				)
++				if (result.exitCode === 0) {
++					this.logger.log(`Published machine port ${hostPort}/${protocol}`)
++					continue
++				}
++				// Docker leaves a created-but-not-started container behind on port conflicts
++				await execa('docker', ['rm', '--force', name], {reject: false, timeout: 30_000})
++				const message = /port is already allocated|address already in use/i.test(result.stderr)
++					? `port ${hostPort}/${protocol} is already in use on the Docker host`
++					: result.stderr
++				this.logger.error(`Failed to publish machine port ${hostPort}/${protocol}: ${message}`)
++			}
++		} catch (error) {
++			this.logger.error('Failed to reconcile machine port relays', error)
++		}
++	}
++
+ 	async #removeManagedNftRules(table: string, chain: string) {
+ 		const current = await execa('nft', ['-a', 'list', 'chain', 'ip', table, chain], {reject: false, timeout: 10_000})
+ 		for (const match of current.stdout.matchAll(/comment "umbrel-machines"[^\n]*# handle (\d+)/g)) {
+@@ -465,6 +584,7 @@ export default class Libvirt {
+ 			await this.#removeManagedNftRules('filter', 'DOCKER-USER')
+ 			await this.#removeManagedNftRules('libvirt_network', 'guest_input')
+ 			await this.#removeManagedNftRules('libvirt_network', 'guest_cross')
++			if (DOCKER_CONTAINER_NAME) await this.#reconcileDockerRelays([])
+ 			await execa('virsh', ['--connect', LIBVIRT_URI, 'net-destroy', MACHINE_NETWORK_NAME], {
+ 				reject: false,
+ 				timeout: 10_000,
+diff --git a/packages/umbreld/source/modules/machines/machines.ts b/packages/umbreld/source/modules/machines/machines.ts
+index df2a10ce..a7ee3fec 100644
+--- a/packages/umbreld/source/modules/machines/machines.ts
++++ b/packages/umbreld/source/modules/machines/machines.ts
+@@ -901,7 +901,11 @@ export function renderCloudInitUserData(
+ 
+ 	const commands = [...(provisioning.commands ?? [])]
+ 	if (provisioning.graphical) commands.push(['systemctl', 'set-default', 'graphical.target'])
+-	if (commands.length) cloudConfig.runcmd = commands
++	// Umbrel removes the seed media once setup completes. Without a datasource
++	// on later boots, cloud-init would probe cloud metadata services (EC2 and
++	// others) for minutes before letting the guest finish booting.
++	commands.push(['touch', '/etc/cloud/cloud-init.disabled'])
++	cloudConfig.runcmd = commands
+ 
+ 	if (completionUrl) {
+ 		cloudConfig.phone_home = {
+diff --git a/packages/umbreld/source/modules/migration/routes.ts b/packages/umbreld/source/modules/migration/routes.ts
+index 993ed2a7..e88324b6 100644
+--- a/packages/umbreld/source/modules/migration/routes.ts
++++ b/packages/umbreld/source/modules/migration/routes.ts
+@@ -1,38 +1,23 @@
+ import {router, privateProcedure, publicProcedureWhenNoUserExists} from '../server/trpc/trpc.js'
+ 
+-import {
+-	findExternalUmbrelInstall,
+-	runPreMigrationChecks,
+-	migrateData,
+-	getMigrationStatus,
+-	unmountExternalDrives,
+-} from './migration.js'
++import {getMigrationStatus} from './migration.js'
+ import isUmbrelHome from '../is-umbrel-home.js'
+ 
++const unsupportedMessage = 'Migration from an external Umbrel installation is not supported in Docker.'
++
+ export default router({
+ 	isUmbrelHome: privateProcedure.query(() => isUmbrelHome()),
+ 	// TODO: Implement
+ 	isMigratingFromUmbrelHome: privateProcedure.query(() => false),
+ 
+-	canMigrate: privateProcedure.query(async ({ctx}) => {
+-		const currentInstall = ctx.umbreld.dataDirectory
+-		const externalUmbrelInstall = await findExternalUmbrelInstall()
+-		await runPreMigrationChecks(currentInstall, externalUmbrelInstall as string, ctx.umbreld)
+-		await unmountExternalDrives()
+-
+-		return true
++	canMigrate: privateProcedure.query(async () => {
++		throw new Error(unsupportedMessage)
+ 	}),
+ 
+ 	// TODO: Refactor this into a subscription
+ 	migrationStatus: publicProcedureWhenNoUserExists.query(() => getMigrationStatus()),
+ 
+-	migrate: privateProcedure.mutation(async ({ctx}) => {
+-		const currentInstall = ctx.umbreld.dataDirectory
+-		const externalUmbrelInstall = await findExternalUmbrelInstall()
+-		await runPreMigrationChecks(currentInstall, externalUmbrelInstall as string, ctx.umbreld)
+-
+-		void migrateData(currentInstall, externalUmbrelInstall as string, ctx.umbreld)
+-
+-		return true
++	migrate: privateProcedure.mutation(async () => {
++		throw new Error(unsupportedMessage)
+ 	}),
+ })
+diff --git a/packages/umbreld/source/modules/server/index.ts b/packages/umbreld/source/modules/server/index.ts
+index 716cc8a6..4b55e507 100644
+--- a/packages/umbreld/source/modules/server/index.ts
++++ b/packages/umbreld/source/modules/server/index.ts
+@@ -263,12 +263,24 @@ class Server {
+ 			}
+ 
+ 			try {
++				const containerName = process.env.UMBREL_CONTAINER_NAME
++
++				if (!containerName) {
++					throw new Error('Failed to determine the Umbrel container name')
++				}
++
+ 				// Force the browser to treat the request as a file download
+ 				response.set('Content-Disposition', `attachment;filename=umbrel-${Date.now()}.log.gz`)
+-				const journal = $`journalctl`
+-				await pipeline(journal.stdout!, createGzip(), response)
++				response.set('Content-Type', 'application/gzip')
++
++				const logs = $({all: true})`docker logs ${containerName}`
++				await pipeline(logs.all!, createGzip(), response)
+ 			} catch (error) {
+ 				this.logger.error(`Error streaming logs`, error)
++
++				if (!response.headersSent) {
++					response.status(500).send('Failed to download logs')
++				}
+ 			}
+ 		})
+ 
+diff --git a/packages/umbreld/source/modules/server/trpc/index.ts b/packages/umbreld/source/modules/server/trpc/index.ts
+index c3f5c9aa..55c8f711 100644
+--- a/packages/umbreld/source/modules/server/trpc/index.ts
++++ b/packages/umbreld/source/modules/server/trpc/index.ts
+@@ -22,6 +22,8 @@ import lanIngress from '../../lan-ingress/routes.js'
+ import mcp from '../../mcp/routes.js'
+ import photos from '../../photos/routes.js'
+ 
++import {CpuTemperatureUnavailableError} from '../../system/system.js'
++
+ import {type WebSocketServer} from 'ws'
+ import type Umbreld from '../../../index.js'
+ 
+@@ -66,10 +68,14 @@ export function createInternalTrpcCaller(umbreld: Umbreld): InternalTrpcCaller {
+ 	})
+ }
+ 
++// Errors that are expected in Docker and would only flood the logs
++const isQuietError = (error: {cause?: unknown}) => error.cause instanceof CpuTemperatureUnavailableError
++
+ export const trpcExpressHandler = createExpressMiddleware({
+ 	router: appRouter,
+ 	createContext: createContextExpress,
+ 	onError({error, ctx}) {
++		if (isQuietError(error)) return
+ 		ctx?.logger.error(`${ctx?.request?.method} ${ctx?.request?.path}`, error)
+ 	},
+ })
+@@ -96,6 +102,7 @@ export const trpcWssHandler = ({
+ 			pongWaitMs: 5_000,
+ 		},
+ 		onError({error, ctx, path}) {
++			if (isQuietError(error)) return
+ 			logger.error(`WS ${path}`, error)
+ 		},
+ 	})
+diff --git a/packages/umbreld/source/modules/startup-migrations/index.ts b/packages/umbreld/source/modules/startup-migrations/index.ts
+index f7a187cf..8363d0f3 100644
+--- a/packages/umbreld/source/modules/startup-migrations/index.ts
++++ b/packages/umbreld/source/modules/startup-migrations/index.ts
+@@ -1,13 +1,9 @@
+ import fse from 'fs-extra'
+-import {z} from 'zod'
+ import yaml from 'js-yaml'
+ import semver from 'semver'
+ 
+ import type Umbreld from '../../index.js'
+ 
+-import {detectDevice, commitOsPartition} from '../system/system.js'
+-import {findExternalUmbrelInstall, runPreMigrationChecks, migrateData} from '../migration/migration.js'
+-
+ async function readYaml(path: string) {
+ 	return yaml.load(await fse.readFile(path, 'utf8'))
+ }
+@@ -26,127 +22,6 @@ class Migration {
+ 		this.logger = umbreld.logger.createChildLogger(name.toLowerCase())
+ 	}
+ 
+-	// One off migration to complete the Mender to Rugix state migration
+-	// On the initial boot after a Mender to Rugix migration, the OS overlay path is a symbolic link.
+-	// This allows the system to boot and come online but some state management features are broken in this state.
+-	// An additional rugix commit and then reboot is required to complete the migration.
+-	async finalizeMenderToRugixStateMigration() {
+-		const osPersistentOverlayPath = '/data/umbrel-os'
+-
+-		const isSymbolicLink = (await fse.lstat(osPersistentOverlayPath)).isSymbolicLink()
+-		// TODO: Check with Maxi how safe this is. If there's any scenario where Rugix won't migrate the symlink overlay
+-		// into a real directory overlay then this can result in an infinite boot loop.
+-		if (!isSymbolicLink) return {reboot: false}
+-
+-		// This should only ever happen once. We allow 3 attempts to handle edge cases or situations where some random failures happen.
+-		// If it fails consistently then we'll give up to prevent a boot loop.
+-		const menderToRugixMigrationAttempt = (await this.umbreld.store.get('migration.menderToRugixAttempt')) || 0
+-		if (menderToRugixMigrationAttempt >= 3) {
+-			this.logger.error('Mender to Rugix state migration has been attempted 5 times, giving up to prevent a boot loop!')
+-			return {reboot: false}
+-		}
+-
+-		// Increment the attempt count
+-		await this.umbreld.store.set('migration.menderToRugixAttempt', menderToRugixMigrationAttempt + 1)
+-
+-		// Finalize the migration by committing the OS partition and rebooting
+-		this.logger.log(
+-			'OS overlay path is a symbolic link, committing and rebooting to complete Mender to Rugix state migration...',
+-		)
+-		// This should've already happened in umbreld.start() but we'll just explicitly do it again here to be sure.
+-		await commitOsPartition(this.umbreld)
+-		return {reboot: true}
+-	}
+-
+-	// One off migration for legacy custom Linux install users
+-	async migrateLegacyLinuxData() {
+-		const {deviceId} = await detectDevice()
+-
+-		// Only run this on unknown devices AKA not a Home or a Pi
+-		if (deviceId !== 'unknown') return
+-
+-		// Don't do anything if a user has already been registered
+-		if (await this.umbreld.user.exists()) return
+-
+-		this.logger.log(
+-			'Unkown device booting for the first time, checking if we need to migrate legacy Linux install data...',
+-		)
+-
+-		const externalUmbrelInstall = await findExternalUmbrelInstall()
+-		if (!externalUmbrelInstall) {
+-			this.logger.log('No legacy Linux install found, skipping migration')
+-			return
+-		}
+-
+-		this.logger.log('Legacy Linux install found, migrating data...')
+-
+-		const currentInstall = this.umbreld.dataDirectory
+-		await runPreMigrationChecks(currentInstall, externalUmbrelInstall as string, this.umbreld, false)
+-		await this.umbreld.server.start()
+-		await migrateData(currentInstall, externalUmbrelInstall as string, this.umbreld)
+-		this.logger.log('Migration complete!')
+-	}
+-
+-	async activateImportedDataDirectory() {
+-		const importData = `${this.umbreld.dataDirectory}/import`
+-		const importDataExists = await fse.exists(importData)
+-		if (!importDataExists) return
+-		this.logger.log('Found Umbrel data to import, activating...')
+-		// We have to move the import dir parrallel to the data dir and then overwrte.
+-		// This is because fse.move doesn't work if the source is a subdirectory of the destination.
+-		// This is fine to do on Umbrel Home because all of /home is on the large data partition.
+-		// On Rasperry Pi the data partition is small on the SD card and only the data dir on the
+-		// large external USB storage. We don't currently support data import on Pi so it's ok for now
+-		// but we'll need to handle this if we want to support it in the future.
+-		const temporaryData = `${this.umbreld.dataDirectory}-import-temp`
+-		await fse.move(importData, temporaryData, {overwrite: true})
+-		await fse.move(temporaryData, this.umbreld.dataDirectory, {overwrite: true})
+-	}
+-
+-	async migrateLegacyData() {
+-		// Check for a legacy <1.0 Umbrel data directory
+-		const userJsonPath = `${this.umbreld.dataDirectory}/db/user.json`
+-		const userJsonExists = await fse.exists(userJsonPath)
+-		if (!userJsonExists) return
+-		this.logger.log('Found legacy Umbrel data, migrating...')
+-
+-		// Validate the data
+-		const legacyDataSchema = z.object({
+-			name: z.string(),
+-			password: z.string(),
+-			installedApps: z.array(z.string()).optional(),
+-			repos: z.array(z.string()),
+-			remoteTorAccess: z.boolean().optional(),
+-			otpUri: z.string().optional(),
+-		})
+-		const legacyDataJson = await fse.readJson(userJsonPath)
+-		const legacyData = legacyDataSchema.parse(legacyDataJson)
+-
+-		// Migrate data
+-		await this.umbreld.user.setName(legacyData.name)
+-		await this.umbreld.user.setHashedPassword(legacyData.password)
+-		if (legacyData.otpUri) await this.umbreld.user.enable2fa(legacyData.otpUri)
+-		await this.umbreld.store.set('appRepositories', legacyData.repos)
+-		if (legacyData.installedApps) await this.umbreld.store.set('apps', legacyData.installedApps)
+-		if (legacyData.remoteTorAccess) await this.umbreld.store.set('torEnabled', legacyData.remoteTorAccess)
+-
+-		// Showcase widgets for migrating users
+-		await this.umbreld.store.set('widgets', ['umbrel:memory', 'umbrel:system-stats', 'umbrel:storage'])
+-
+-		// Ensure we have app repositories pulled otherwise there will be a race condition where
+-		// if an app gets started before the repo has completed it's initial pull on startup we'll
+-		// get the error `App with ID <appId> not found in any repository `
+-		await this.umbreld.appStore.update()
+-
+-		// Mark the legacy file as migrated
+-		await fse.move(userJsonPath, `${userJsonPath}.migrated`)
+-
+-		// Move the .env file so env vars don't get preserved
+-		const envPath = `${this.umbreld.dataDirectory}/.env`
+-		await fse.move(envPath, `${envPath}.migrated`)
+-		this.logger.log('Migration successful')
+-	}
+-
+ 	async migrateBackThatMacUpPort() {
+ 		// Check if the Back That Mac Up app is installed
+ 		const isBackThatMacUpInstalled = ((await this.umbreld.store.get('apps')) || []).includes('back-that-mac-up')
+@@ -186,37 +61,30 @@ class Migration {
+ 		this.logger.log('Checking if any migrations are needed...')
+ 
+ 		// Ensure data directory exists
+-		await fse.ensureDir(this.umbreld.dataDirectory)
++		// await fse.ensureDir(this.umbreld.dataDirectory)
+ 
+ 		// Check for Mender to Rugix state migration and complete it if needed
+-		try {
+-			const {reboot} = await this.finalizeMenderToRugixStateMigration()
+-			// We don't want to continue with any other migrations
+-			if (reboot) return {reboot: true}
+-		} catch (error) {
+-			this.logger.error(`Failed to finalize Mender to Rugix state migration`, error)
+-		}
+-
+-		// Check for a data directory to import
+-		try {
+-			await this.activateImportedDataDirectory()
+-		} catch (error) {
+-			this.logger.error(`Failed to activate imported Umbrel data`, error)
+-		}
++		// try {
++		// 	const {reboot} = await this.finalizeMenderToRugixStateMigration()
++		// 	// We don't want to continue with any other migrations
++		// 	if (reboot) return {reboot: true}
++		// } catch (error) {
++		// 	this.logger.error(`Failed to finalize Mender to Rugix state migration`, error)
++		//}
+ 
+ 		// Check for a legacy <1.0 Umbrel data directory and migrate to 1.0 format if found
+-		try {
+-			await this.migrateLegacyData()
+-		} catch (error) {
+-			this.logger.error(`Failed to migrate legacy data`, error)
+-		}
++		//try {
++		//	await this.migrateLegacyData()
++		//} catch (error) {
++		//	this.logger.error(`Failed to migrate legacy data`, error)
++		//}
+ 
+ 		// Check for first boot of an unknown device and migrate legacy Linux install data if it exists
+-		try {
+-			await this.migrateLegacyLinuxData()
+-		} catch (error) {
+-			this.logger.error(`Failed to migrate legacy Linux data`, error)
+-		}
++		// try {
++		// 	await this.migrateLegacyLinuxData()
++		// } catch (error) {
++		// 	this.logger.error(`Failed to migrate legacy Linux data`, error)
++		//}
+ 
+ 		// Check for the Back That Mac Up app and migrate it if it exists
+ 		try {
+diff --git a/packages/umbreld/source/modules/system/factory-reset.ts b/packages/umbreld/source/modules/system/factory-reset.ts
+index cd548cb9..96ad7b33 100644
+--- a/packages/umbreld/source/modules/system/factory-reset.ts
++++ b/packages/umbreld/source/modules/system/factory-reset.ts
+@@ -1,52 +1,11 @@
+-import path from 'node:path'
+-
+-import {$} from 'execa'
+-import fse from 'fs-extra'
+-
+ import type Umbreld from '../../index.js'
+-import {reboot} from './system.js'
+ 
+-const BACKUP_PREFIX = 'umbrel-factory-reset'
+-const RAID_FACTORY_RESET_PREPARE_HOOK = '/etc/rugix/hooks/state-reset/prepare/10-umbrel.sh'
+-
+-// Factory reset using Rugix Ctrl's state management. This triggers an immediate reboot.
+-// We use the --backup flag which renames the old state directory instead of deleting
+-// it during boot. This makes boot fast (mv is instant) and we clean up the old
+-// state in the background after umbreld starts.
++// Factory reset relies on Rugix Ctrl, which is not available in Docker.
+ export async function performReset(umbreld: Umbreld) {
+-	const isRunningFromRaidData = await umbreld.hardware.raid.isRunningFromRaidData().catch(() => false)
+-
+-	if (isRunningFromRaidData) {
+-		// Rugix resets the active data mount. When that mount is the RAID dataset,
+-		// using Rugix would move/reset the previous install and hide the saved boot
+-		// config needed for onboarding recovery. For RAID-backed data we only reset
+-		// the boot/internal state: clear the config partition, wipe the boot disk
+-		// data partition, leave the RAID pool untouched, then reboot to onboarding.
+-		await $`${RAID_FACTORY_RESET_PREPARE_HOOK}`
+-		await reboot()
+-		return
+-	}
+-
+-	const timestamp = Math.floor(Date.now() / 1000)
+-	await $`rugix-ctrl state reset --backup --backup-name ${BACKUP_PREFIX}-${timestamp}`
++	throw new Error('Factory reset is not supported in a Docker container, just remove the volume instead!')
+ }
+ 
+ // Clean up state backups from factory resets
+ export async function cleanupFactoryResetBackups(umbreld: Umbreld) {
+-	const stateDir = '/run/rugix/mounts/data/state'
+-
+-	try {
+-		const entries = await fse.readdir(stateDir)
+-
+-		// Loop through all backups in case multiple exist
+-		for (const entry of entries) {
+-			if (entry.startsWith(BACKUP_PREFIX)) {
+-				const backupPath = path.join(stateDir, entry)
+-				umbreld.logger.log(`Cleaning up factory reset backup: ${entry}`)
+-				await fse.remove(backupPath).catch((error) => umbreld.logger.error(`Failed to remove backup ${entry}`, error))
+-			}
+-		}
+-	} catch (error) {
+-		umbreld.logger.error('Failed to cleanup factory reset backups', error)
+-	}
++	return
+ }
+diff --git a/packages/umbreld/source/modules/system/routes.ts b/packages/umbreld/source/modules/system/routes.ts
+index 5c6c3b20..20b5d075 100644
+--- a/packages/umbreld/source/modules/system/routes.ts
++++ b/packages/umbreld/source/modules/system/routes.ts
+@@ -45,6 +45,9 @@ import {runAfterResponse} from '../server/run-after-response.js'
+ type SystemStatus = 'running' | 'updating' | 'shutting-down' | 'restarting' | 'migrating' | 'resetting' | 'restoring'
+ let systemStatus: SystemStatus = 'running'
+ 
++const unsupportedNetworkMessage = 'Network configuration is not supported in Docker.'
++const unsupportedUpdateMessage = 'Updates are not supported in Docker. Update the Docker image instead.'
++
+ // Quick hack so we can set system status from migration module until we refactor this
+ export function setSystemStatus(status: SystemStatus) {
+ 	systemStatus = status
+@@ -71,24 +74,17 @@ function startPowerAction(
+ }
+ 
+ async function getSystemLogs(type: 'umbrelos' | 'system', lines = 1500, maxOutputBytes?: number) {
+-	if (!maxOutputBytes) {
+-		const process =
+-			type === 'umbrelos'
+-				? await $`journalctl --unit umbrel --unit umbreld-production --unit umbreld --unit ui --lines ${lines}`
+-				: await $`journalctl --lines ${lines}`
+-		return stripAnsi(process.stdout)
+-	}
++	if (type === 'system') return 'System logs are not available in the Docker version of Umbrel.'
++
++	const containerName = process.env.UMBREL_CONTAINER_NAME
++	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
+ 
+-	const journal =
+-		type === 'umbrelos'
+-			? $({buffer: false})`journalctl --unit umbrel --unit umbreld-production --unit umbreld --unit ui --lines ${lines}`
+-			: $({buffer: false})`journalctl --lines ${lines}`
+-	// umbreld has no inherited stdin under systemd, so execa's default stdin is
+-	// unavailable. The second process needs an explicit pipe for journalctl.
+-	const tail = $({stdin: 'pipe'})`tail --bytes ${maxOutputBytes}`
+-	journal.pipeStdout!(tail)
+-	const [, process] = await Promise.all([journal, tail])
+-	return stripAnsi(process.stdout)
++	const logs = await $`docker logs --tail ${lines} ${containerName}`
++	const output = stripAnsi(`${logs.stdout}\n${logs.stderr}`.trim())
++	if (!maxOutputBytes) return output
++
++	const buffer = Buffer.from(output)
++	return buffer.length > maxOutputBytes ? buffer.subarray(buffer.length - maxOutputBytes).toString() : output
+ }
+ 
+ // Fold device-wide usage a member can't inspect into a single 'other' entry.
+@@ -163,46 +159,32 @@ export default router({
+ 		let {version, name, releaseNotes} = await getLatestRelease(ctx.umbreld)
+ 		// v prefix is needed in the tag name for legacy reasons, remove it before comparing to local version
+ 		const available = version.replace('v', '') !== ctx.umbreld.version
++
++		if (available) {
++			throw new Error(unsupportedUpdateMessage)
++		}
++
+ 		return {available, version, name, releaseNotes}
+ 	}),
+-	getReleaseChannel: privateProcedure.query(async ({ctx}) => {
+-		return (await ctx.umbreld.store.get('settings.releaseChannel')) || 'stable'
+-	}),
++	getReleaseChannel: privateProcedure.query(() => 'stable'),
+ 	setReleaseChannel: privateProcedure
+ 		.input(
+ 			z.object({
+ 				channel: z.enum(['stable', 'beta']),
+ 			}),
+ 		)
+-		.mutation(async ({ctx, input}) => {
+-			return ctx.umbreld.store.set('settings.releaseChannel', input.channel)
++		.mutation(async () => {
++			throw new Error(unsupportedUpdateMessage)
+ 		}),
+-	isExternalDns: privateProcedure.query(async ({ctx}) => {
+-		return await ctx.umbreld.store.get('settings.externalDns', true)
+-	}),
+-	setExternalDns: privateProcedure.input(z.boolean()).mutation(async ({ctx, input}) => {
+-		const previousExternalDns = await ctx.umbreld.store.get('settings.externalDns', true)
+-		if (previousExternalDns === input) return true
+-		await ctx.umbreld.store.set('settings.externalDns', input)
+-		try {
+-			const success = await syncDns()
+-			if (!success) throw new Error('Failed to synchronize external DNS setting')
+-			return true
+-		} catch (error) {
+-			await ctx.umbreld.store.set('settings.externalDns', previousExternalDns)
+-			throw error
+-		}
++	isExternalDns: privateProcedure.query(() => true),
++	setExternalDns: privateProcedure.input(z.boolean()).mutation(async () => {
++		throw new Error(unsupportedNetworkMessage)
+ 	}),
+ 	update: privateProcedure.mutation(async ({ctx}) => {
+ 		systemStatus = 'updating'
+ 		let success = false
+ 		try {
+ 			success = await performUpdate(ctx.umbreld)
+-			if (success) {
+-				await setTimeout(1000)
+-				await ctx.umbreld.stop()
+-				await reboot()
+-			}
+ 		} finally {
+ 			if (!success) systemStatus = 'running'
+ 		}
+@@ -258,7 +240,9 @@ export default router({
+ 					.regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, 'Invalid hostname'),
+ 			}),
+ 		)
+-		.mutation(async ({ctx, input}) => setHostname(ctx.umbreld, input.hostname)),
++		.mutation(async () => {
++			throw new Error('Changing the hostname is not supported in Docker.')
++		}),
+ 	setStaticIp: privateProcedure
+ 		.input(
+ 			z.object({
+@@ -269,7 +253,9 @@ export default router({
+ 				dns: z.array(z.string().ip({version: 'v4', message: 'Invalid IPv4 DNS address'})).min(1),
+ 			}),
+ 		)
+-		.mutation(async ({ctx, input}) => setStaticIp(ctx.umbreld, input)),
++		.mutation(async () => {
++			throw new Error(unsupportedNetworkMessage)
++		}),
+ 	// Public so it can be called from a new origin after an IP change, where no browser credential is available.
+ 	confirmStaticIp: publicProcedure
+ 		.input(
+@@ -277,14 +263,18 @@ export default router({
+ 				ip: z.string().ip({version: 'v4', message: 'Invalid IPv4 address'}),
+ 			}),
+ 		)
+-		.mutation(async ({input}) => confirmStaticIp(input.ip)),
++		.mutation(async () => {
++			throw new Error(unsupportedNetworkMessage)
++		}),
+ 	clearStaticIp: privateProcedure
+ 		.input(
+ 			z.object({
+ 				mac: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i, 'Invalid MAC address'),
+ 			}),
+ 		)
+-		.mutation(async ({ctx, input}) => clearStaticIp(ctx.umbreld, input)),
++		.mutation(async () => {
++			throw new Error(unsupportedNetworkMessage)
++		}),
+ 	// Public during onboarding and recovery mode so users can shut down during RAID setup or mount failure
+ 	shutdown: publicProcedureWhenNoUserExists.mutation(({ctx}) => {
+ 		startPowerAction(ctx.umbreld, ctx.response, 'shutting-down', shutdown)
+@@ -312,23 +302,7 @@ export default router({
+ 				password: z.string().optional(),
+ 			}),
+ 		)
+-		.mutation(async ({ctx, input}) => {
+-			// Skip password validation in recovery mode (RAID mount failure) since user data is inaccessible
+-			const raidMountFailure = await ctx.umbreld.hardware.raid.checkRaidMountFailure()
+-			if (!raidMountFailure) {
+-				if (!input.password || !(await ctx.user.validatePassword(input.password))) {
+-					throw new TRPCError({code: 'UNAUTHORIZED', message: 'Invalid password'})
+-				}
+-			}
+-			systemStatus = 'resetting'
+-			try {
+-				// Wait for UI to poll status (polls every 10s) and see we're resetting
+-				await setTimeout(11000)
+-				// Triggers an immediate reboot via Rugix or the RAID-safe reset path
+-				await performReset(ctx.umbreld)
+-			} catch (error) {
+-				systemStatus = 'running'
+-				throw error
+-			}
++		.mutation(async () => {
++			throw new Error('Factory reset is not supported in Docker. Remove the data volume to reset Umbrel.')
+ 		}),
+ })
+diff --git a/packages/umbreld/source/modules/system/system.ts b/packages/umbreld/source/modules/system/system.ts
+index 3ccfcfd5..e67af46b 100644
+--- a/packages/umbreld/source/modules/system/system.ts
++++ b/packages/umbreld/source/modules/system/system.ts
+@@ -14,13 +14,23 @@ import {escapeSpecialRegExpLiterals} from '../utilities/regexp.js'
+ import pWaitFor from 'p-wait-for'
+ import {getGpuDeviceUsage, type GpuDeviceUsage} from '../hardware/gpu-usage.js'
+ 
++// Docker: containers and VMs (Docker Desktop, WSL2) usually expose no thermal
++// sensor. The dashboard polls every 5 seconds and already shows a placeholder,
++// so this expected error is not logged by the tRPC handlers.
++export class CpuTemperatureUnavailableError extends Error {
++	constructor() {
++		super('Could not get CPU temperature')
++		this.name = 'CpuTemperatureUnavailableError'
++	}
++}
++
+ export async function getCpuTemperature(): Promise<{
+ 	warning: 'normal' | 'warm' | 'hot'
+ 	temperature: number
+ }> {
+ 	// Get CPU temperature
+ 	const cpuTemperature = await systemInformation.cpuTemperature()
+-	if (typeof cpuTemperature.main !== 'number') throw new Error('Could not get CPU temperature')
++	if (typeof cpuTemperature.main !== 'number') throw new CpuTemperatureUnavailableError()
+ 	const temperature = cpuTemperature.main
+ 
+ 	// CPU temperature warnings are temporarily disabled for the umbrelOS 2.0 beta.
+@@ -264,42 +274,22 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+ 	apps: MemoryUsage[]
+ 	machines: Array<{id: string; name: string; osId: string; used: number}>
+ }> {
+-	// Attribution model:
+-	// - totalUsed: system-wide pressure-relevant used memory from MemAvailable
+-	// - app.used: cgroup memory.current + (memory.swap.current * avg zram RAM ratio)
+-	//   This captures all memory the kernel charges to the container: process RSS,
+-	//   file cache, slab, page tables, and kernel stacks — not just process-visible PSS.
+-	// - system: residual (totalUsed - sum(app.used))
+-
+-	// Read meminfo first so the measurment isn't affected by docker
++	// Docker: the host cgroup hierarchy is not visible from inside the container
++	// (and does not exist on Docker Desktop), so attribute memory with `docker stats`.
++
++	// Read meminfo first so the measurement is not affected by Docker.
+ 	const {size, totalUsed} = await getSystemMemoryFromMeminfo()
+-	const [containerIds, zramRamFactor, machineUsage] = await Promise.all([
+-		getDockerContainerIds(),
+-		getZramRamFactor(),
+-		umbreld.machines.runtimeResourceUsage(),
+-	])
+-	const safeZramRamFactor = clampNonNegativeNumber(zramRamFactor)
++	const containerMemory = await getDockerContainerMemory(umbreld)
+ 
+ 	const apps = await Promise.all(
+ 		umbreld.apps.instances.map(async (app) => {
+ 			try {
+ 				const containerNames = await app.getContainerNames()
+-
+-				// Look up cgroup memory for each of the app's containers.
+-				const cgroupResults = await Promise.all(
+-					containerNames.map(async (name) => {
+-						const containerId = containerIds.get(name)
+-						if (!containerId) return {used: 0, swap: 0}
+-						return getContainerCgroupMemory(containerId)
+-					}),
+-				)
+-
+-				const appUsed = clampByteCount(cgroupResults.reduce((total, cg) => total + cg.used, 0))
+-				const appSwap = clampByteCount(cgroupResults.reduce((total, cg) => total + cg.swap, 0))
++				const appUsed = containerNames.reduce((total, name) => total + (containerMemory.get(name) ?? 0), 0)
+ 
+ 				return {
+ 					id: app.id,
+-					used: clampByteCount(appUsed + appSwap * safeZramRamFactor, size),
++					used: clampByteCount(appUsed, size),
+ 				}
+ 			} catch (error) {
+ 				umbreld.logger.error(`Error getting memory`, error)
+@@ -313,15 +303,70 @@ export async function getMemoryUsage(umbreld: Umbreld): Promise<{
+ 
+ 	// Calculate memory used by the system (total - apps)
+ 	const appsTotal = clampByteCount(apps.reduce((total, app) => total + app.used, 0))
+-	const machinesTotal = clampByteCount(machineUsage.memory.reduce((total, machine) => total + machine.used, 0))
+-	const system = clampByteCount(totalUsed - appsTotal - machinesTotal, totalUsed)
++	const system = clampByteCount(totalUsed - appsTotal, totalUsed)
+ 
+ 	return {
+ 		size,
+ 		totalUsed,
+ 		system,
+ 		apps,
+-		machines: machineUsage.memory,
++		machines: [],
++	}
++}
++
++// Parses Docker memory values such as "512MiB", "1.5GiB", or "200MB".
++function parseDockerByteSize(value: string): number {
++	const match = value.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)$/i)
++	if (!match) return 0
++
++	const amount = Number(match[1])
++	if (!Number.isFinite(amount) || amount < 0) return 0
++
++	const unit = match[2].toLowerCase()
++	const multipliers: Record<string, number> = {
++		b: 1,
++		kb: 1_000,
++		mb: 1_000_000,
++		gb: 1_000_000_000,
++		tb: 1_000_000_000_000,
++		pb: 1_000_000_000_000_000,
++		eb: 1_000_000_000_000_000_000,
++		kib: 1024,
++		mib: 1024 ** 2,
++		gib: 1024 ** 3,
++		tib: 1024 ** 4,
++		pib: 1024 ** 5,
++		eib: 1024 ** 6,
++	}
++
++	return clampByteCount(amount * (multipliers[unit] ?? 0))
++}
++
++// Returns the memory used by every running Docker container, keyed by name.
++async function getDockerContainerMemory(umbreld: Umbreld): Promise<Map<string, number>> {
++	try {
++		const format = '{{json .}}'
++		const {stdout} = await $`docker stats --no-stream --format ${format}`
++		const result = new Map<string, number>()
++
++		for (const line of stdout.trim().split('\n')) {
++			if (!line) continue
++
++			try {
++				const stats = JSON.parse(line) as {Name?: string; MemUsage?: string}
++				const name = stats.Name ?? ''
++				const memoryUsage = stats.MemUsage?.split('/')[0]?.trim() ?? ''
++
++				if (name) result.set(name, parseDockerByteSize(memoryUsage))
++			} catch (error) {
++				umbreld.logger.error('Failed to parse Docker memory statistics', error)
++			}
++		}
++
++		return result
++	} catch (error) {
++		umbreld.logger.error('Failed to read Docker memory statistics', error)
++		return new Map()
+ 	}
+ }
+ 
+@@ -421,88 +466,187 @@ export function aggregateGpuUsage(rawDevices: GpuDeviceUsage[], pidToApp: Map<nu
+ 	}
+ }
+ 
+-// Returns a list of all processes and their cpu usage
+-async function getProcessesCpu() {
+-	// Get a snapshot of system CPU and memory usage
+-	const top = await $`top --batch-mode --iterations 1`
++// Docker: CPU usage is computed from /proc deltas between two snapshots instead
++// of a single `top` iteration, whose sampling window is too short to be accurate.
++// The container shares the host PID namespace, so /proc lists every process and
++// /proc/<pid>/cgroup tells which Docker container a process belongs to.
++type CpuSnapshot = {
++	time: number
++	// Clock ticks (USER_HZ) summed over all CPUs, from /proc/stat
++	total: number
++	idle: number
++	// Clock ticks since boot, to recognise processes started after this snapshot
++	uptime: number
++	processes: Map<number, {ticks: number; startTime: number; containerId: string | null}>
++}
++
++const CLOCK_TICKS_PER_SECOND = 100
++const CPU_SNAPSHOT_MAX_AGE = 10_000
++const CPU_SAMPLE_INTERVAL = 500
++const CPU_USAGE_CACHE_TIME = 750
++const CONTAINER_IDS_CACHE_TIME = 5_000
+ 
+-	// Get lines
+-	const lines = top.stdout.split('\n').map((line) => line.trim().split(/\s+/))
++let lastCpuSnapshot: CpuSnapshot | undefined
++let cpuUsageCache: {time: number; promise: ReturnType<typeof computeCpuUsage>} | undefined
++let containerIdsCache: {time: number; ids: Map<string, string>} | undefined
+ 
+-	// Find header and CPU column
+-	const headerIndex = lines.findIndex((line) => line[0] === 'PID')
+-	const cpuIndex = lines[headerIndex].findIndex((column) => column === '%CPU')
++async function readProcessCpu(pid: number) {
++	try {
++		const [stat, cgroup] = await Promise.all([
++			fse.readFile(`/proc/${pid}/stat`, 'utf8'),
++			fse.readFile(`/proc/${pid}/cgroup`, 'utf8'),
++		])
++		// The command name can contain spaces, so parse the fields after its closing parenthesis
++		const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
++		const ticks = Number(fields[11]) + Number(fields[12]) // utime + stime
++		const startTime = Number(fields[19])
++		if (!Number.isFinite(ticks) || !Number.isFinite(startTime)) return null
++		// Matches /docker/<id> (cgroupfs) and /docker-<id>.scope (systemd)
++		const containerId = cgroup.match(/docker[/-]([0-9a-f]{64})/)?.[1] ?? null
++		return {ticks, startTime, containerId}
++	} catch {
++		// The process exited while we were reading it
++		return null
++	}
++}
+ 
+-	// Get CPU threads
+-	const threads = os.cpus().length
++async function readCpuSnapshot(): Promise<CpuSnapshot> {
++	const [stat, uptime, entries] = await Promise.all([
++		fse.readFile('/proc/stat', 'utf8'),
++		fse.readFile('/proc/uptime', 'utf8'),
++		fse.readdir('/proc'),
++	])
+ 
+-	// Ignore lines before the header
+-	const processes = lines.slice(headerIndex + 1).map((line) => {
+-		// Parse values
+-		return {
+-			pid: parseInt(line[0], 10),
+-			// Convert to % of total system not % of a single thread
+-			cpu: parseFloat(line[cpuIndex]) / threads,
+-		}
++	// cpu  user nice system idle iowait irq softirq steal guest guest_nice
++	const cpu = stat.split('\n')[0].trim().split(/\s+/).slice(1).map(Number)
++	// guest and guest_nice are already included in user and nice
++	const total = cpu.slice(0, 8).reduce((sum, value) => sum + (value || 0), 0)
++	const idle = (cpu[3] || 0) + (cpu[4] || 0)
++
++	const pids = entries.filter((entry) => /^\d+$/.test(entry)).map(Number)
++	const processes = new Map<number, {ticks: number; startTime: number; containerId: string | null}>()
++	const results = await Promise.all(pids.map((pid) => readProcessCpu(pid)))
++	pids.forEach((pid, index) => {
++		const result = results[index]
++		if (result) processes.set(pid, result)
+ 	})
+ 
+-	return processes
++	return {
++		time: Date.now(),
++		total,
++		idle,
++		uptime: Number(uptime.split(' ')[0]) * CLOCK_TICKS_PER_SECOND,
++		processes,
++	}
+ }
+ 
+-type CpuUsage = {
+-	id: string
+-	used: number
+-}
++// Returns the full ID of every running container, keyed by name.
++async function getContainerIds(): Promise<Map<string, string>> {
++	if (containerIdsCache && Date.now() - containerIdsCache.time < CONTAINER_IDS_CACHE_TIME) {
++		return containerIdsCache.ids
++	}
+ 
+-export async function getCpuUsage(umbreld: Umbreld): Promise<{
+-	threads: number
+-	totalUsed: number
+-	system: number
+-	apps: CpuUsage[]
+-	machines: Array<{id: string; name: string; osId: string; used: number}>
+-}> {
+-	// Get snapshots close together so the residual system bucket stays useful.
+-	const [processes, machineUsage] = await Promise.all([getProcessesCpu(), umbreld.machines.runtimeResourceUsage()])
++	const format = '{{.ID}} {{.Names}}'
++	const {stdout} = await $`docker ps --no-trunc --format ${format}`
++	const ids = new Map<string, string>()
++	for (const line of stdout.trim().split('\n')) {
++		const [id, name] = line.trim().split(' ')
++		if (id && name) ids.set(name, id)
++	}
++
++	containerIdsCache = {time: Date.now(), ids}
++	return ids
++}
+ 
+-	// Calculate total CPU used by all processes
+-	const totalUsed = processes.reduce((total, process) => total + process.cpu, 0)
++async function computeCpuUsage(umbreld: Umbreld) {
++	// Take a short sample when there is no recent snapshot to compare against
++	let previous = lastCpuSnapshot
++	if (!previous || Date.now() - previous.time > CPU_SNAPSHOT_MAX_AGE) {
++		previous = await readCpuSnapshot()
++		await setTimeout(CPU_SAMPLE_INTERVAL)
++	}
++	const current = await readCpuSnapshot()
++	lastCpuSnapshot = current
++
++	const totalTicks = current.total - previous.total
++	const toPercent = (ticks: number) => (totalTicks > 0 ? Math.min(100, Math.max(0, (ticks / totalTicks) * 100)) : 0)
++
++	// Total CPU used by the whole system, including the kernel
++	const totalUsed = toPercent(totalTicks - (current.idle - previous.idle))
++
++	// CPU ticks used by each container since the previous snapshot
++	const containerTicks = new Map<string, number>()
++	for (const [pid, process] of current.processes) {
++		if (!process.containerId) continue
++		const before = previous.processes.get(pid)
++		let ticks = 0
++		if (before && before.startTime === process.startTime) ticks = process.ticks - before.ticks
++		else if (process.startTime >= previous.uptime) ticks = process.ticks
++		if (ticks > 0) containerTicks.set(process.containerId, (containerTicks.get(process.containerId) ?? 0) + ticks)
++	}
+ 
+-	// Calculate CPU used by the processes owned by each app
++	// Calculate CPU used by the containers owned by each app
++	const containerIds = await getContainerIds().catch((error) => {
++		umbreld.logger.error(`Error getting container IDs`, error)
++		return new Map<string, string>()
++	})
+ 	const apps = await Promise.all(
+ 		umbreld.apps.instances.map(async (app) => {
+-			let appUsed = 0
++			let appTicks = 0
+ 			try {
+-				const appPids = await app.getPids()
+-				appUsed = processes
+-					.filter((process) => appPids.includes(process.pid))
+-					.reduce((total, process) => total + process.cpu, 0)
++				const containerNames = await app.getContainerNames()
++				for (const name of containerNames) {
++					const id = containerIds.get(name)
++					if (id) appTicks += containerTicks.get(id) ?? 0
++				}
+ 			} catch (error) {
+ 				umbreld.logger.error(`Error getting cpu`, error)
+ 			}
+ 			return {
+ 				id: app.id,
+-				used: appUsed,
++				used: toPercent(appTicks),
+ 			}
+ 		}),
+ 	)
+ 
+ 	// Calculate CPU used by the system (total - apps)
+ 	const appsTotal = apps.reduce((total, app) => total + app.used, 0)
+-	const machinesTotal = machineUsage.cpu.reduce((total, machine) => total + machine.used, 0)
+-	const system = Math.max(0, totalUsed - appsTotal - machinesTotal)
+-
+-	// Get total CPU threads
+-	const threads = os.cpus().length
++	const system = Math.max(0, totalUsed - appsTotal)
+ 
+ 	return {
+-		threads,
++		threads: os.cpus().length,
+ 		totalUsed,
+ 		system,
+ 		apps,
+-		machines: machineUsage.cpu,
++		machines: [] as Array<{id: string; name: string; osId: string; used: number}>,
+ 	}
+ }
+ 
++type CpuUsage = {
++	id: string
++	used: number
++}
++
++export async function getCpuUsage(umbreld: Umbreld): Promise<{
++	threads: number
++	totalUsed: number
++	system: number
++	apps: CpuUsage[]
++	machines: Array<{id: string; name: string; osId: string; used: number}>
++}> {
++	// The dashboard polls every second, possibly from several clients at once.
++	// Share recent results so concurrent calls don't produce near-empty samples.
++	if (!cpuUsageCache || Date.now() - cpuUsageCache.time > CPU_USAGE_CACHE_TIME) {
++		const promise = computeCpuUsage(umbreld)
++		cpuUsageCache = {time: Date.now(), promise}
++		promise.catch(() => {
++			if (cpuUsageCache?.promise === promise) cpuUsageCache = undefined
++		})
++	}
++
++	return await cpuUsageCache.promise
++}
++
+ // TODO: For powercycle methods we will probably want to handle cleanly stopping
+ // as much Umbrel stuff as possible ourselves before handing over to the OS.
+ // This will give us more control over the order of things terminating and allow
+@@ -510,78 +654,40 @@ export async function getCpuUsage(umbreld: Umbreld): Promise<{
+ // umbreld gets killed.
+ 
+ export async function shutdown(): Promise<boolean> {
+-	await $`poweroff`
++	const containerName = process.env.UMBREL_CONTAINER_NAME
++	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
++
++	void (async () => {
++		await setTimeout(250)
++		await $({reject: false})`docker stop --time 50 ${containerName}`
++	})()
+ 
+ 	return true
+ }
+ 
++// Docker: the entrypoint starts umbreld again when it exits with this code.
++export const REBOOT_EXIT_CODE = 75
++
+ export async function reboot(): Promise<boolean> {
+-	await $`reboot`
++	void setTimeout(250).then(() => process.exit(REBOOT_EXIT_CODE))
+ 
+ 	return true
+ }
+ 
+ export async function commitOsPartition(umbreld: Umbreld): Promise<boolean> {
+-	try {
+-		umbreld.logger.log('Committing OS partition...')
+-		await $`rugix-ctrl system commit`
+-		umbreld.logger.log('Successfully commited to new OS partition.')
+-		return true
+-	} catch (error) {
+-		umbreld.logger.error(`Failed to commit OS partition`, error)
+-		return false
+-	}
++	return true
+ }
+ 
+ export async function detectDevice() {
+-	let {manufacturer, model, serial, uuid, sku, version} = await systemInformation.system()
+-	let productName = model
+-	model = sku
+-	let device = productName // TODO: Maybe format this better in the future.
+-
+-	// Used for update server
+-	let deviceId = 'unknown'
+-
+-	if (model === 'U130120') device = 'Umbrel Home (2023)'
+-	if (model === 'U130121') device = 'Umbrel Home (2024)'
+-	if (model === 'U130122') device = 'Umbrel Home (2025)'
+-	if (productName === 'Umbrel Home') deviceId = model
+-
+-	// No year suffix for Umbrel Pro until if/when a newer model exists
+-	if (model === 'U4XN1') device = 'Umbrel Pro'
+-	if (productName === 'Umbrel Pro') deviceId = model
+-
+-	// I haven't been able to find another way to reliably detect Pi hardware. Most existing
+-	// solutions don't actually detect Pi hardware but just detect Pi OS which we don't match.
+-	// e.g systemInformation includes Pi detection which fails here. Also there's no SMBIOS so
+-	// no values like manufacturer or model to check. I did notice the Raspberry Pi model is
+-	// appended to the output of `/proc/cpuinfo` so we can use that to detect Pi hardware.
+-	try {
+-		const cpuInfo = await fse.readFile('/proc/cpuinfo')
+-		if (cpuInfo.includes('Raspberry Pi ')) {
+-			manufacturer = 'Raspberry Pi'
+-			productName = 'Raspberry Pi'
+-			model = version
+-			if (cpuInfo.includes('Raspberry Pi 5 ')) {
+-				device = 'Raspberry Pi 5'
+-				deviceId = 'pi-5'
+-			}
+-			if (cpuInfo.includes('Raspberry Pi 4 ')) {
+-				device = 'Raspberry Pi 4'
+-				deviceId = 'pi-4'
+-			}
+-		}
+-	} catch (error) {
+-		// /proc/cpuinfo might not exist on some systems, do nothing.
+-	}
+-
+-	// Blank out model and serial for non Umbrel devices
+-	if (productName !== 'Umbrel Home' && productName !== 'Umbrel Pro') {
+-		model = ''
+-		serial = ''
++	return {
++		deviceId: 'docker',
++		device: 'Umbrel for Docker',
++		productName: 'Umbrel for Docker',
++		manufacturer: 'Docker',
++		model: '',
++		serial: '',
++		uuid: '',
+ 	}
+-
+-	return {deviceId, device, productName, manufacturer, model, serial, uuid}
+ }
+ 
+ export async function isRaspberryPi() {
+@@ -609,108 +715,23 @@ export async function setupPiCpuGovernor(umbreld: Umbreld): Promise<void> {
+ }
+ 
+ export async function hasWifi() {
+-	const {stdout} = await $`nmcli --terse --fields TYPE device status`
+-	const networkDevices = stdout.split('\n')
+-
+-	return networkDevices.includes('wifi')
++	return false
+ }
+ 
+ export async function getWifiNetworks() {
+-	const listNetworks = await $`nmcli --terse --fields IN-USE,SSID,SECURITY,SIGNAL device wifi list`
+-
+-	// Format into object
+-	const networks = listNetworks.stdout.split('\n').map((item: string) => {
+-		const [inUse, ssid, security, signal] = item.split(':')
+-		return {
+-			active: inUse === '*',
+-			ssid,
+-			authenticated: !!security,
+-			signal: parseInt(signal),
+-		}
+-	})
+-
+-	const filteredNetworks = networks
+-		// Remove duplicate and empty SSIDs
+-		.filter((network, index, list) => {
+-			if (network.ssid === '') return false
+-			const indexOfFirstEntry = list.findIndex((item) => item.ssid === network.ssid)
+-			return indexOfFirstEntry === index
+-		})
+-		// Reapply active status in case it got removed in filtering
+-		.map((network) => {
+-			network.active = network.active || networks.some((item) => item.ssid === network.ssid && item.active)
+-			return network
+-		})
+-		// Order by SSID
+-		.sort((a, b) => a.ssid.localeCompare(b.ssid))
+-
+-	return filteredNetworks
++	return [] as Array<{active: boolean; ssid: string; authenticated: boolean; signal: number}>
+ }
+ 
+ export async function deleteWifiConnections({inactiveOnly = false}: {inactiveOnly?: boolean}) {
+-	const connections = await $`nmcli --terse --fields UUID,TYPE,ACTIVE connection`
+-	for (const connection of connections.stdout.split('\n')) {
+-		const [uuid, type, active] = connection.split(':')
+-		// Type will be something like '802-11-wireless'
+-		if (!type?.includes('wireless')) continue
+-		if (inactiveOnly && active === 'yes') continue
+-		await $`nmcli connection delete ${uuid}`
+-	}
++	return
+ }
+ 
+-export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}) {
+-	let connection
+-	if (password !== undefined) {
+-		connection = $`nmcli device wifi connect ${ssid} password ${password}`
+-	} else {
+-		connection = $`nmcli device wifi connect ${ssid}`
+-	}
+-
+-	try {
+-		await connection
+-
+-		// Destroy any inactive WiFi connections incase we just transitioned
+-		// from a previous wireless connection. We don't wanna leave that
+-		// conneciton in NetworkManager since it will be out of sync with umbreld.
+-		try {
+-			await deleteWifiConnections({inactiveOnly: true})
+-		} catch (error) {
+-			console.log(`Failed to cleanup WiFi connections: ${(error as Error).message}`)
+-		}
+-
+-		return true
+-	} catch (error) {
+-		// We destroy the failed WiFi connection if we fail to connect to the network.
+-		// This is so umbreld retains ownership of the network connection management.
+-		// Otherwise if this fails nmcli will remember the connection and try to reconnect
+-		// which umbreld is not aware of.
+-		try {
+-			await deleteWifiConnections({inactiveOnly: true})
+-		} catch (error) {
+-			console.log(`Failed to cleanup WiFi connections: ${(error as Error).message}`)
+-		}
+-
+-		if (connection.exitCode === 10) throw new Error('Network not found')
+-		if (connection.exitCode === 1 || connection.exitCode === 4) throw new Error('Incorrect password')
+-		throw new Error('Connection failed')
+-	}
++export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}): Promise<boolean> {
++	throw new Error('WiFi is not supported in Docker.')
+ }
+ 
+ export async function restoreWiFi(umbreld: Umbreld): Promise<void> {
+-	const wifiCredentials = await umbreld.store.get('settings.wifi')
+-	if (!wifiCredentials) return
+-
+-	while (true) {
+-		umbreld.logger.log(`Attempting to restore WiFi connection to ${wifiCredentials.ssid}...`)
+-		try {
+-			await connectToWiFiNetwork(wifiCredentials)
+-			umbreld.logger.log(`WiFi connection restored!`)
+-			break
+-		} catch (error) {
+-			umbreld.logger.error(`Failed to restore WiFi connection, retrying in 1 minute`, error)
+-			await setTimeout(1000 * 60)
+-		}
+-	}
++	return
+ }
+ 
+ // Get IP addresses of the device
+@@ -778,81 +799,7 @@ type NetworkInterface = {
+ 
+ // Get all physical network interfaces with connection details
+ export async function getNetworkInterfaces(umbreld?: Umbreld): Promise<NetworkInterface[]> {
+-	const {stdout: deviceOutput} = await $`nmcli --terse --fields DEVICE,TYPE,STATE,CONNECTION device status`
+-	const configuredStaticSettings = (await umbreld?.store.get('settings.staticIp')) ?? {}
+-
+-	const interfaces = await Promise.all(
+-		deviceOutput
+-			.split('\n')
+-			.filter((line) => line.trim())
+-			.map((line) => {
+-				const parts = line.split(':')
+-				return {
+-					device: parts[0],
+-					type: parts[1],
+-					state: parts[2],
+-					// Connection name could contain colons, so join remaining parts
+-					connection: parts.slice(3).join(':'),
+-				}
+-			})
+-			// Only include ethernet and wifi types
+-			.filter(({type}) => type === 'ethernet' || type === 'wifi')
+-			.map(async ({device, type, state, connection}) => {
+-				// For ethernet interfaces, verify they're backed by physical hardware
+-				// by checking for the presence of a device symlink in sysfs. Virtual
+-				// interfaces (veth, bridges, docker) won't have this.
+-				if (type === 'ethernet') {
+-					const isPhysical = await fse.pathExists(`/sys/class/net/${device}/device`)
+-					if (!isPhysical) return null
+-				}
+-
+-				const mac = (await fse.readFile(`/sys/class/net/${device}/address`, 'utf8')).trim()
+-
+-				const iface: NetworkInterface = {
+-					id: device,
+-					mac,
+-					type: type as 'ethernet' | 'wifi',
+-					connected: state === 'connected',
+-				}
+-				const configuredStaticSetting = configuredStaticSettings[mac]
+-				if (configuredStaticSetting) iface.configuredStaticSettings = configuredStaticSetting
+-
+-				// If connected, get IP configuration from the active connection
+-				if (iface.connected && connection && connection !== '--') {
+-					try {
+-						const {stdout} =
+-							await $`nmcli --terse --fields ipv4.method,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS connection show ${connection}`
+-
+-						// nmcli terse format uses ":" as delimiter with keys like
+-						// "IP4.ADDRESS[1]", "IP4.DNS[1]", "IP4.DNS[2]" for multi-value fields
+-						for (const connLine of stdout.split('\n')) {
+-							const [key, ...valueParts] = connLine.split(':')
+-							const value = valueParts.join(':')
+-
+-							if (key === 'ipv4.method') {
+-								iface.ipMethod = value === 'manual' ? 'static' : 'dhcp'
+-							} else if (key.startsWith('IP4.ADDRESS') && !iface.ip) {
+-								const [ip, prefix] = value.split('/')
+-								iface.ip = ip
+-								iface.subnetPrefix = parseInt(prefix)
+-							} else if (key === 'IP4.GATEWAY' && value && value !== '0.0.0.0') {
+-								iface.gateway = value
+-							} else if (key.startsWith('IP4.DNS') && value) {
+-								if (!iface.dns) iface.dns = []
+-								iface.dns.push(value)
+-							}
+-						}
+-					} catch {
+-						// Connection details unavailable
+-					}
+-				}
+-
+-				return iface
+-			}),
+-	)
+-
+-	// Filter out null entries (virtual ethernet interfaces)
+-	return interfaces.filter((iface) => iface !== null)
++	return []
+ }
+ 
+ // Find an interface by MAC address
+@@ -936,100 +883,24 @@ export async function setStaticIp(
+ 	umbreld: Umbreld,
+ 	config: {mac: string; ip: string; subnetPrefix: number; gateway: string; dns: string[]},
+ ) {
+-	const {mac, ip, subnetPrefix, gateway, dns} = config
+-	const networkInterface = await getInterfaceByMac(mac)
+-	if (networkInterface.type === 'wifi') throw new Error('Static IP is not supported for WiFi interfaces')
+-
+-	// Capture previous config for rollback
+-	const currentSettings = await umbreld.store.get('settings.staticIp')
+-	const previousConfig = currentSettings?.[mac] ? {mac, ...currentSettings[mac]} : null
+-
+-	// Apply the new config
+-	await applyStaticIp(config)
+-
+-	// Wait for the client to confirm connectivity by calling confirmStaticIp
+-	// with the new IP. If not confirmed within 30 seconds, revert.
+-	confirmedStaticIp = ''
+-	try {
+-		await pWaitFor(() => confirmedStaticIp === ip, {interval: 100, timeout: 30_000})
+-	} catch {
+-		// Timed out — revert to previous config
+-		if (previousConfig) await applyStaticIp(previousConfig).catch(() => {})
+-		else await clearStaticIp(umbreld, {mac}).catch(() => {})
+-		throw new Error('Static IP change was not confirmed within 30 seconds, reverted to previous settings')
+-	}
+-
+-	// If we haven't thrown by now the new static IP settings are confirmed to be working, so we can persist them.
+-	// Persist to store so settings survive reboots
+-	await umbreld.store.getWriteLock(async ({get, set}) => {
+-		const settings = (await get('settings.staticIp')) ?? {}
+-		settings[mac] = {ip, subnetPrefix, gateway, dns}
+-		await set('settings.staticIp', settings)
+-	})
+-	await umbreld.lanIngress.refresh().catch((error) => umbreld.logger.error('Failed to refresh LAN ingress', error))
++	throw new Error('Network configuration is not supported in Docker.')
+ }
+ 
+ // Clear static IP and revert to DHCP
+ export async function clearStaticIp(umbreld: Umbreld, {mac}: {mac: string}) {
+-	const networkInterface = await getInterfaceByMac(mac)
+-	const device = networkInterface.id
+-	const connection = await getConnectionByDevice(device)
+-	if (connection) {
+-		await $`nmcli connection modify ${connection} ipv4.method auto ipv4.addresses ${''} ipv4.gateway ${''} ipv4.dns ${''}`
+-		// If the interface is disconnected we still want to clear the saved
+-		// profile, but there is no live connection to bounce.
+-		if (networkInterface.connected) {
+-			await $`nmcli connection down ${connection}`
+-			await $`nmcli connection up ${connection}`
+-		}
+-	}
+-
+-	// Remove from store
+-	await umbreld.store.getWriteLock(async ({get, set}) => {
+-		const settings = (await get('settings.staticIp')) ?? {}
+-		delete settings[mac]
+-		await set('settings.staticIp', settings)
+-	})
+-	await umbreld.lanIngress.refresh().catch((error) => umbreld.logger.error('Failed to refresh LAN ingress', error))
++	throw new Error('Network configuration is not supported in Docker.')
+ }
+ 
+ // Restore static IP settings from store on startup
+ export async function restoreStaticIp(umbreld: Umbreld): Promise<void> {
+-	const settings = await umbreld.store.get('settings.staticIp')
+-	if (!settings) return
+-
+-	for (const [mac, config] of Object.entries(settings)) {
+-		try {
+-			const networkInterface = await getInterfaceByMac(mac)
+-			if (networkInterface.type === 'wifi') {
+-				umbreld.logger.log(`Skipping static IP restore for ${mac}: WiFi interfaces are not supported`)
+-				continue
+-			}
+-			const device = await applyStaticIp({mac, ...config})
+-			umbreld.logger.log(`Restored static IP for ${mac} (${device})`)
+-		} catch (error) {
+-			umbreld.logger.error(`Failed to restore static IP for ${mac}`, error)
+-		}
+-	}
++	return
+ }
+ 
+ const syncDnsQueue = new PQueue({concurrency: 1})
+ 
+ // Update DNS configuration to match user settings
+ export async function syncDns() {
+-	return await syncDnsQueue.add(async () => {
+-		const {mtimeMs: mtimeBefore} = await fse.promises.stat('/etc/resolv.conf')
+-		await $`systemctl restart umbrel-dns-sync`
+-		await setTimeout(1000) // evade restart limits
+-		await $`systemctl restart NetworkManager`
+-		let retries = 2
+-		do {
+-			await setTimeout(1000)
+-			const {mtimeMs: mtimeAfter} = await fse.promises.stat('/etc/resolv.conf')
+-			if (mtimeAfter > mtimeBefore) return true
+-		} while (retries--)
+-		return false
+-	})
++	return true
+ }
+ 
+ // Wait for Pi system time to be synced for up to the number of seconds passed in.
+@@ -1058,41 +929,13 @@ export async function waitForSystemTime(umbreld: Umbreld, timeout: number): Prom
+ }
+ 
+ export async function getHostname() {
+-	const hostname = await fse.readFile('/etc/hostname', 'utf8')
+-	return hostname.trim()
++	const containerName = process.env.UMBREL_CONTAINER_NAME
++	if (!containerName) throw new Error('Failed to determine the Umbrel container name.')
++
++	return containerName
+ }
+ 
+ async function applyHostname(umbreld: Umbreld, hostname: string) {
+-	const previousHostname = await getHostname().catch(() => '')
+-
+-	// Update static hostname and hosts mapping
+-	await fse.writeFile('/etc/hostname', `${hostname}\n`)
+-
+-	const etcHosts = await fse.readFile('/etc/hosts', 'utf8')
+-	const previousHostnameInEtcHostsRe =
+-		previousHostname &&
+-		new RegExp(`^(\\s*127\\.0\\.(?:0|1)\\.1\\s+)${escapeSpecialRegExpLiterals(previousHostname)}\\s*$`, 'm')
+-	let updatedEtcHosts = previousHostnameInEtcHostsRe
+-		? etcHosts.replace(previousHostnameInEtcHostsRe, `$1${hostname}`)
+-		: etcHosts
+-
+-	const hostnameInEtcHostsRe = new RegExp(
+-		`^\\s*127\\.0\\.(?:0|1)\\.1\\s+${escapeSpecialRegExpLiterals(hostname)}\\s*$`,
+-		'm',
+-	)
+-	if (!hostnameInEtcHostsRe.test(updatedEtcHosts)) {
+-		updatedEtcHosts = `${updatedEtcHosts.trimEnd()}\n127.0.0.1       ${hostname}\n`
+-	}
+-	if (updatedEtcHosts !== etcHosts) await fse.writeFile('/etc/hosts', updatedEtcHosts)
+-
+-	// Apply new hostname
+-	await $`hostname ${hostname}`
+-
+-	// Restart hostname-dependent services
+-	await $`systemctl restart avahi-daemon`
+-	await umbreld.lanIngress.refresh().catch((error) => umbreld.logger.error('Failed to refresh LAN ingress', error))
+-
+-	umbreld.logger.log(`Applied hostname '${hostname}'`)
+ 	return hostname
+ }
+ 
+diff --git a/packages/umbreld/source/modules/system/update.ts b/packages/umbreld/source/modules/system/update.ts
+index 7bb8551e..240daca7 100644
+--- a/packages/umbreld/source/modules/system/update.ts
++++ b/packages/umbreld/source/modules/system/update.ts
+@@ -1,7 +1,6 @@
+-import {$} from 'execa'
+ import type {ProgressStatus} from '../apps/schema.js'
+ import {detectDevice, isUmbrelOS} from './system.js'
+-import Umbreld from '../../index.js'
++import type Umbreld from '../../index.js'
+ 
+ type UpdateStatus = ProgressStatus
+ 
+@@ -68,78 +67,13 @@ export async function getLatestRelease(umbreld: Umbreld) {
+ 	return data as {version: string; name: string; releaseNotes: string; updateScript?: string}
+ }
+ 
+-export async function performUpdate(umbreld: Umbreld) {
+-	setUpdateStatus({running: true, progress: 0, description: 'Updating...', error: false})
+-
+-	try {
+-		const {updateScript} = await getLatestRelease(umbreld)
+-
+-		if (!updateScript) {
+-			setUpdateStatus({error: 'No update script found'})
+-			throw new Error('No update script found')
+-		}
+-
+-		const result = await fetch(updateScript, {
+-			headers: {'User-Agent': `umbrelOS ${umbreld.version}`},
+-		})
+-		const updateSCriptContents = await result.text()
+-
+-		// Exectute update script and report progress
+-		const process = $`bash -c ${updateSCriptContents}`
+-		let previousProgress = 0
+-		async function handleUpdateScriptOutput(chunk: Buffer) {
+-			const text = chunk.toString()
+-			const lines = text.split('\n')
+-			for (const line of lines) {
+-				// Handle our custom status updates
+-				if (line.startsWith('umbrel-update: ')) {
+-					try {
+-						const status = JSON.parse(line.replace('umbrel-update: ', '')) as Partial<UpdateStatus>
+-						setUpdateStatus(status)
+-					} catch (error) {
+-						// Don't kill update on JSON parse errors
+-					}
+-				}
+-
+-				// Handle rugix install progress
+-				try {
+-					const status = JSON.parse(line) as {event: 'UpdateProgress'; progress: number}
+-					if (status.event !== 'UpdateProgress' || typeof status.progress !== 'number') throw new Error('Invalid event')
+-
+-					// Only log every integer progress increment to avoid spamming events
+-					const progress = Math.floor(status.progress)
+-					if (progress > previousProgress) {
+-						previousProgress = progress
+-						umbreld.logger.log(`Update progress: ${progress}%`)
+-						setUpdateStatus({progress})
+-					}
+-				} catch (error) {
+-					// Ignore JSON parse errors
+-				}
+-			}
+-		}
+-		process.stdout?.on('data', (chunk) => handleUpdateScriptOutput(chunk))
+-		process.stderr?.on('data', (chunk) => handleUpdateScriptOutput(chunk))
+-
+-		// Wait for script to complete and handle errors
+-		await process
+-	} catch (error) {
+-		// Don't overwrite a useful error message reported by the update script
+-		if (!updateStatus.error) setUpdateStatus({error: 'Update failed'})
+-
+-		// Reset the state back to running but leave the error message so ui polls
+-		// can differentiate between a successful update after reboot and a failed
+-		// update that didn't reboot.
+-		const errorStatus = updateStatus.error
+-		resetUpdateStatus()
+-		setUpdateStatus({error: errorStatus})
+-
+-		umbreld.logger.error(`Update script failed`, error)
+-
+-		return false
+-	}
+-
+-	setUpdateStatus({running: false, progress: 100, description: 'Restarting...'})
++export async function performUpdate(_umbreld: Umbreld) {
++	setUpdateStatus({
++		running: false,
++		progress: 0,
++		description: '',
++		error: 'Updates are not supported in Docker. Update the Docker image instead.',
++	})
+ 
+-	return true
++	return false
+ }

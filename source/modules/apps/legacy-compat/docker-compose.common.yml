@@ -1,4 +1,0 @@
-networks:
-  default:
-    external:
-      name: umbrel_main_network
