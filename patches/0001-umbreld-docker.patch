@@ -3223,6 +3223,23 @@ index f7a187cf..8363d0f3 100644
  
  		// Check for the Back That Mac Up app and migrate it if it exists
  		try {
+diff --git a/packages/umbreld/source/modules/system-ng/advertisement.ts b/packages/umbreld/source/modules/system-ng/advertisement.ts
+index 2ce7c745..af4e0536 100644
+--- a/packages/umbreld/source/modules/system-ng/advertisement.ts
++++ b/packages/umbreld/source/modules/system-ng/advertisement.ts
+@@ -36,6 +36,12 @@ export default class Advertisement {
+ 	}
+ 
+ 	async start() {
++		// Docker: the container has no Avahi daemon and does not own the host's mDNS
++		if (process.env.UMBREL_CONTAINER_NAME) {
++			this.logger.log('mDNS advertisement is disabled in Docker')
++			return
++		}
++
+ 		this.logger.log('Starting advertisement')
+ 
+ 		// Non-fatal: environments without Avahi (development, tests) fail the write
 diff --git a/packages/umbreld/source/modules/system/factory-reset.ts b/packages/umbreld/source/modules/system/factory-reset.ts
 index cd548cb9..96ad7b33 100644
 --- a/packages/umbreld/source/modules/system/factory-reset.ts
