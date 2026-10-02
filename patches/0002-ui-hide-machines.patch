@@ -1,0 +1,105 @@
+diff --git a/packages/ui/src/components/cmdk-sources.tsx b/packages/ui/src/components/cmdk-sources.tsx
+index ccf49630..56ca54ff 100644
+--- a/packages/ui/src/components/cmdk-sources.tsx
++++ b/packages/ui/src/components/cmdk-sources.tsx
+@@ -25,6 +25,7 @@ import {useNavigate as useFilesNavigate} from '@/features/files/hooks/use-naviga
+ import {useSearchFiles} from '@/features/files/hooks/use-search-files'
+ import {getLastFilesPath} from '@/features/files/utils/last-files-path'
+ import {useMachinesCmdkEntries} from '@/features/machines/cmdk-entries'
++import {useMachinesAvailable} from '@/features/machines/hooks/use-machines'
+ import type {Item as PhotoItem} from '@/features/photos/hooks/use-items'
+ import {useDebugInstallRandomApps} from '@/hooks/use-debug-install-random-apps'
+ import {useLaunchApp} from '@/hooks/use-launch-app'
+@@ -452,6 +453,7 @@ export function useCmdkEntries(): CmdkEntry[] | null {
+ 	const {shortcuts} = useShortcuts()
+ 	const settingsEntries = useSettingsCmdkEntries()
+ 	const machineEntries = useMachinesCmdkEntries()
++	const machinesAvailable = useMachinesAvailable({enabled: userQ.data?.role === 'owner'})
+ 	const loading = userQ.isLoading || availableApps.isLoading || isLoadingUserApps || !userApps || !userAppsKeyed
+ 	const userId = userQ.data?.userId
+ 	const isMember = userQ.data?.role === 'member'
+@@ -469,6 +471,7 @@ export function useCmdkEntries(): CmdkEntry[] | null {
+ 		shortcuts,
+ 		settingsEntries,
+ 		machineEntries,
++		machinesAvailable,
+ 		userId,
+ 		isMember,
+ 		t,
+@@ -502,7 +505,7 @@ export function useCmdkEntries(): CmdkEntry[] | null {
+ 				icon: systemAppsKeyed['UMBREL_live-usage'].icon,
+ 				onSelect: () => navigate(systemAppsKeyed['UMBREL_live-usage'].systemAppTo),
+ 			},
+-			...(isMember
++			...(isMember || !machinesAvailable
+ 				? []
+ 				: [
+ 						{
+diff --git a/packages/ui/src/features/files/components/sidebar/index.tsx b/packages/ui/src/features/files/components/sidebar/index.tsx
+index 45c18144..df42d527 100644
+--- a/packages/ui/src/features/files/components/sidebar/index.tsx
++++ b/packages/ui/src/features/files/components/sidebar/index.tsx
+@@ -13,6 +13,7 @@ import {SidebarExternalStorage} from '@/features/files/components/sidebar/sideba
+ import {SidebarFavorites} from '@/features/files/components/sidebar/sidebar-favorites'
+ import {SidebarHome} from '@/features/files/components/sidebar/sidebar-home'
+ import {SidebarMachines} from '@/features/files/components/sidebar/sidebar-machines'
++import {useMachinesAvailable} from '@/features/machines/hooks/use-machines'
+ import {SidebarNetworkStorage} from '@/features/files/components/sidebar/sidebar-network-storage'
+ import {SidebarRecents} from '@/features/files/components/sidebar/sidebar-recents'
+ import {SidebarOwnersUmbrel, SidebarSharedStorage} from '@/features/files/components/sidebar/sidebar-shared-with-me'
+@@ -64,7 +65,8 @@ export function Sidebar({className}: {className?: string}) {
+ 	const showTrash = !hidden.trash
+ 	const showRewind = !hidden.rewind && !isMember
+ 	const showCloud = !hidden.cloud
+-	const showMachines = !hidden.machines && !isMember
++	const machinesAvailable = useMachinesAvailable({enabled: !isMember})
++	const showMachines = !hidden.machines && !isMember && machinesAvailable
+ 
+ 	return (
+ 		<nav className={cn('flex flex-col', className)} aria-label={t('files-sidebar.navigation')}>
+diff --git a/packages/ui/src/features/machines/hooks/use-machines.ts b/packages/ui/src/features/machines/hooks/use-machines.ts
+index a4a6f01f..169c0dab 100644
+--- a/packages/ui/src/features/machines/hooks/use-machines.ts
++++ b/packages/ui/src/features/machines/hooks/use-machines.ts
+@@ -117,6 +117,12 @@ export function useMachineCapabilities() {
+ 	return {capabilities: query.data, isLoading: query.isLoading}
+ }
+ 
++// Hide Machines entry points on hosts without virtualization (e.g. umbrelOS in Docker)
++export function useMachinesAvailable({enabled = true}: {enabled?: boolean} = {}) {
++	const query = trpcReact.machines.capabilities.useQuery(undefined, {staleTime: Infinity, retry: false, enabled})
++	return query.data?.libvirtAvailable === true
++}
++
+ // Machines currently installing. Freshness comes from the single global
+ // owner-only listener mounted next to this hook by FloatingIslandContainer.
+ export function useInstallingMachines({enabled = true}: {enabled?: boolean} = {}) {
+diff --git a/packages/ui/src/modules/desktop/dock.tsx b/packages/ui/src/modules/desktop/dock.tsx
+index cbeb329d..db4b1fec 100644
+--- a/packages/ui/src/modules/desktop/dock.tsx
++++ b/packages/ui/src/modules/desktop/dock.tsx
+@@ -4,6 +4,7 @@ import {useLocation, useNavigate} from 'react-router-dom'
+ 
+ import {Glass} from '@/components/ui/glass'
+ import {getLastFilesPath} from '@/features/files/utils/last-files-path'
++import {useMachinesAvailable} from '@/features/machines/hooks/use-machines'
+ import {useAppsWithUpdates} from '@/hooks/use-apps-with-updates'
+ import {useIsMobile} from '@/hooks/use-is-mobile'
+ import {useSettingsNotificationCount} from '@/hooks/use-settings-notification-count'
+@@ -72,6 +73,7 @@ export function Dock() {
+ 	const {data: user} = trpcReact.user.get.useQuery()
+ 	const isMember = user?.role === 'member'
+ 	const isOwner = user?.role === 'owner'
++	const machinesAvailable = useMachinesAvailable({enabled: isOwner})
+ 
+ 	const appUpdateCount = appsWithUpdates.length
+ 
+@@ -139,7 +141,7 @@ export function Dock() {
+ 					notificationCount={isMember ? undefined : appUpdateCount}
+ 					mouseX={mouseX}
+ 				/>
+-				{isOwner && (
++				{isOwner && machinesAvailable && (
+ 					<DockItem
+ 						iconSize={iconSize}
+ 						iconSizeZoomed={iconSizeZoomed}

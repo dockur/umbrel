@@ -1,0 +1,5 @@
+# The Docker build applies the patches and runs the scripts on Linux, keep LF
+# line endings even when the repository is checked out on Windows
+*.patch text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf

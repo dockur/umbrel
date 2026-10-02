@@ -296,6 +296,146 @@ mirrorDataMount() {
   return 0
 }
 
+detectContainerIp() {
+
+  local ip=""
+
+  # Apps and Tor reach the dashboard and app ports through this address
+  ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" "$name" 2>/dev/null) || :
+
+  if [ -z "$ip" ] || [[ "$ip" == "<no value>" ]]; then
+    error "Failed to determine the IP address on bridge network '$net'!" && exit 27
+  fi
+
+  export UMBREL_CONTAINER_IP="$ip"
+
+  return 0
+}
+
+runUmbreld() {
+
+  local pid=""
+  local rc=0
+
+  # umbreld exits with code 75 when the user restarts umbrelOS from the dashboard
+  while :; do
+
+    ./umbreld --data-directory "$mount" --log-level normal &
+    pid=$!
+
+    trap 'kill -TERM "$pid" 2>/dev/null || :' TERM INT
+
+    # A trapped signal interrupts wait before umbreld finished shutting down
+    rc=0
+    wait "$pid" || rc=$?
+    while kill -0 "$pid" 2>/dev/null; do
+      rc=0
+      wait "$pid" || rc=$?
+    done
+
+    trap - TERM INT
+
+    if [ "$rc" -ne 75 ]; then
+      exit "$rc"
+    fi
+
+    info "Restarting umbrelOS..."
+  done
+}
+
+hasCapability() {
+
+  local caps
+
+  caps=$(awk '/^CapEff:/ { print $2 }' /proc/self/status)
+  (( (0x$caps >> $1) & 1 ))
+}
+
+nestCgroups() {
+
+  local controller failed="" pid procs
+
+  # With cgroup v2 and a private cgroup namespace, the container's processes
+  # sit in the namespace root. A cgroup that holds processes cannot delegate
+  # the memory and io controllers to child groups, so libvirt fails to create
+  # the machine cgroups. Move them to a leaf group and delegate every
+  # controller, like docker:dind does. Host cgroup namespaces are left alone.
+  [ -f /sys/fs/cgroup/cgroup.controllers ] || return 0
+  [[ "$(</proc/self/cgroup)" == "0::/" ]] || return 0
+
+  mkdir -p /sys/fs/cgroup/init
+
+  # Read the whole list before moving anything: the file changes while
+  # processes move, so reading it line by line skips entries. Repeat for
+  # processes started in the meantime.
+  for _ in 1 2 3 4 5; do
+    procs=$(</sys/fs/cgroup/cgroup.procs)
+    [ -z "$procs" ] && break
+    for pid in $procs; do
+      echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :
+    done
+  done
+
+  # Delegate the controllers one by one so an unsupported one does not block the others
+  for controller in $(</sys/fs/cgroup/cgroup.controllers); do
+    echo "+$controller" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || failed+=" $controller"
+  done
+
+  if [ -n "$failed" ]; then
+    warn "Failed to delegate the cgroup controllers:$failed. Machines may fail to start."
+  fi
+
+  return 0
+}
+
+startMachines() {
+
+  local reason=""
+
+  # Machines need to create bridges, taps and bind mounts (privileged: true)
+  if ! hasCapability 12 || ! hasCapability 21; then
+    reason="the container must run with 'privileged: true'"
+  elif [ ! -c /dev/net/tun ]; then
+    reason="/dev/net/tun is missing"
+  fi
+
+  if [ -n "$reason" ]; then
+    export UMBREL_MACHINES_DISABLED="$reason"
+    info "Machines are disabled: $reason"
+    return 0
+  fi
+
+  if [ -c /dev/kvm ]; then
+    # Docker creates the node as root:root 0600, QEMU runs as libvirt-qemu
+    chgrp kvm /dev/kvm && chmod 660 /dev/kvm
+  else
+    warn "KVM is unavailable, machines will use slow software emulation."
+  fi
+
+  # libvirt's anti-spoofing filters need bridge netfilter (ebtables), which some
+  # kernels such as Docker Desktop's WSL2 kernel are built without
+  if ebtables --concurrent -t nat -N umbrel-probe >/dev/null 2>&1; then
+    ebtables --concurrent -t nat -X umbrel-probe >/dev/null 2>&1 || :
+  else
+    export UMBREL_MACHINES_NO_NWFILTER=1
+    warn "The kernel has no bridge netfilter, machines run without anti-spoofing filters."
+  fi
+
+  nestCgroups
+
+  # Machines never survive a container restart, drop the previous runtime state
+  rm -rf /run/libvirt /run/umbrel-machines /var/lib/libvirt/swtpm
+
+  virtlogd -d
+  libvirtd -d
+
+  if ! timeout 15 sh -c 'until [ -S /run/libvirt/libvirt-sock ]; do sleep 0.2; done'; then
+    warn "libvirt did not start, machines will be unavailable."
+  fi
+
+  return 0
+}
+
 prepareDirectories() {
 
   # Create directories
@@ -322,13 +462,15 @@ checkOtherInstance
 checkPidMode
 configureNetwork
 connectNetwork
+detectContainerIp
 detectDataMount
 checkDataPermissions
 normalizeMountPath
 mirrorDataMount
 prepareDirectories
+startMachines
 
 trap - ERR
 cd /opt/umbreld
 
-exec ./umbreld --data-directory "$mount" --log-level normal
+runUmbreld

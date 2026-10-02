@@ -11,3 +11,5 @@ docker-compose.yml
 renovate.json
 
 *.md
+umbrel
+umbrel-data
