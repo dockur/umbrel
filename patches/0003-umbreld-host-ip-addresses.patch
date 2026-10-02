@@ -1,0 +1,205 @@
+--- a/packages/umbreld/source/modules/system/system.ts
++++ b/packages/umbreld/source/modules/system/system.ts
+@@ -753,7 +753,56 @@
+ }
+ 
+ // Get IP addresses of the device
+-export function getIpAddresses(): string[] {
++export async function getIpAddresses(): Promise<string[]> {
++	// Docker: the addresses the dashboard and the local HTTPS certificate advertise
++	// must be the ones the device is reachable on, which inside a container are the
++	// host's, not the container's own address on the Umbrel bridge network.
++	if (process.env.UMBREL_CONTAINER_NAME) {
++		const hostAddresses = await getHostIpAddresses()
++		if (hostAddresses.length > 0) return hostAddresses
++	}
++
++	return getInterfaceIpAddresses()
++}
++
++// Docker: the container shares the host PID namespace (`pid: host`), so PID 1's
++// interfaces can be read directly when the container may join its network namespace.
++// That needs CAP_SYS_ADMIN: an unprivileged container keeps the interfaces below.
++async function getHostIpAddresses(): Promise<string[]> {
++	try {
++		const {exitCode, stdout} = await $({
++			reject: false,
++			timeout: 10_000,
++		})`nsenter --target 1 --net ip -json -4 address show`
++		if (exitCode !== 0) return []
++
++		const links = JSON.parse(stdout) as Array<{
++			ifname: string
++			addr_info?: Array<{local?: string; scope?: string}>
++		}>
++
++		return filterIpAddresses(
++			links.flatMap((link) =>
++				(link.addr_info ?? []).flatMap(({local, scope}) =>
++					typeof local === 'string' ? [{name: link.ifname, address: local, family: 'IPv4', scope}] : [],
++				),
++			),
++		)
++	} catch {
++		// A container that may not read the host namespace must not fail the caller
++		return []
++	}
++}
++
++type IpAddressCandidate = {
++	name: string
++	address: string
++	family?: string | number
++	internal?: boolean
++	scope?: string
++}
++
++function filterIpAddresses(addresses: IpAddressCandidate[], {excludeUmbrelNetwork = false} = {}): string[] {
+ 	// Known good interfaces:
+ 	// - Umbrel Home 2024: enp1s0, wlo1 (predictable naming)
+ 	// - Raspberry Pi 4/5: end0, wlan0 (custom naming)
+@@ -782,14 +831,16 @@
+ 		// Non-routable APIPA (169.254.0.0/16), e.g. misconfigured DHCP
+ 		/^169\.254\./,
+ 	]
++	// Docker: the container's own address on the Umbrel bridge network is not
++	// reachable from the LAN, so it is never reported as a device address
++	if (excludeUmbrelNetwork) excludeAddressRanges.push(/^10\.21\./)
++
+ 	return (
+-		Object.entries(os.networkInterfaces())
++		addresses
+ 			// Omit interfaces with excluded names
+-			.filter(([name]) => !excludeInterfaceNames.some((expression) => expression.test(name)))
+-			// Flatten interface map to an array of addresses
+-			.flatMap(([name, addresses = []]) => addresses.map((address) => ({name, ...address})))
++			.filter((entry) => !excludeInterfaceNames.some((expression) => expression.test(entry.name)))
+ 			// Select valid non-loopback IPv4 addresses
+-			.filter((entry) => entry.family === 'IPv4' && !entry.internal && isIPv4(entry.address))
++			.filter((entry) => entry.family === 'IPv4' && !entry.internal && entry.scope !== 'host' && isIPv4(entry.address))
+ 			// Omit addresses within excluded ranges
+ 			.filter((entry) => !excludeAddressRanges.some((expression) => expression.test(entry.address)))
+ 			// Return remaining addresses
+@@ -797,6 +848,15 @@
+ 	)
+ }
+ 
++function getInterfaceIpAddresses(): string[] {
++	return filterIpAddresses(
++		Object.entries(os.networkInterfaces())
++			// Flatten interface map to an array of addresses
++			.flatMap(([name, addresses = []]) => addresses.map((address) => ({name, ...address}))),
++		{excludeUmbrelNetwork: Boolean(process.env.UMBREL_CONTAINER_NAME)},
++	)
++}
++
+ type NetworkInterface = {
+ 	id: string
+ 	mac: string
+--- a/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
++++ b/packages/umbreld/source/modules/lan-ingress/lan-ingress.ts
+@@ -384,7 +384,7 @@
+ 		// (e.g. Tailscale's 100.64.0.0/10 address in kernel TUN mode), which is deliberate:
+ 		// ingress listens on all interfaces, so users who install the Umbrel CA get valid
+ 		// HTTPS over VPN access too.
+-		const ips = new Set(['127.0.0.1', ...getIpAddresses()])
++		const ips = new Set(['127.0.0.1', ...(await getIpAddresses())])
+ 
+ 		return {
+ 			dns: [...names].sort(),
+--- a/packages/umbreld/source/modules/system/system.unit.test.ts
++++ b/packages/umbreld/source/modules/system/system.unit.test.ts
+@@ -5,12 +5,21 @@
+ import {describe, afterEach, expect, test, vi} from 'vitest'
+ 
+ // Mocks
++import os from 'node:os'
+ import systemInformation from 'systeminformation'
+ import * as execa from 'execa'
+ import fse from 'fs-extra'
+ 
+ import Umbreld from '../../index.js'
+-import {getCpuTemperature, getMemoryUsage, getDiskUsage, getDiskUsageByPath, shutdown, reboot} from './system.js'
++import {
++	getCpuTemperature,
++	getMemoryUsage,
++	getDiskUsage,
++	getDiskUsageByPath,
++	getIpAddresses,
++	shutdown,
++	reboot,
++} from './system.js'
+ 
+ vi.mock('systeminformation')
+ vi.mock('execa')
+@@ -163,19 +172,68 @@
+ 
+ // Docker: shutdown stops the Umbrel container and reboot restarts umbreld
+ // through the entrypoint, instead of powering off or rebooting the host.
+-function mockDockerCommands() {
++function mockDockerCommands(result: {exitCode?: number; stdout?: string} = {stdout: ''}) {
+ 	const commands: string[] = []
+ 	const tag = vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+ 		commands.push(
+ 			strings.reduce((result, part, index) => result + part + (index < values.length ? String(values[index]) : ''), ''),
+ 		)
+-		return {stdout: ''}
++		return result
+ 	})
+ 	vi.mocked(execa.$).mockImplementation(((first: unknown, ...rest: unknown[]) =>
+ 		Array.isArray(first) ? tag(first as unknown as TemplateStringsArray, ...rest) : tag) as any)
+ 	return commands
+ }
+ 
++// Docker: the dashboard and the local HTTPS certificate must advertise the
++// addresses the device is reachable on, never the container's own address on
++// the Umbrel bridge network (which only the container can reach).
++describe('getIpAddresses', () => {
++	const containerName = process.env.UMBREL_CONTAINER_NAME
++
++	afterEach(() => {
++		if (containerName === undefined) delete process.env.UMBREL_CONTAINER_NAME
++		else process.env.UMBREL_CONTAINER_NAME = containerName
++	})
++
++	test('should report the host addresses when the host namespace is readable', async () => {
++		process.env.UMBREL_CONTAINER_NAME = 'umbrel'
++		const commands = mockDockerCommands({
++			exitCode: 0,
++			stdout: JSON.stringify([
++				{ifname: 'lo', addr_info: [{local: '127.0.0.1', scope: 'host'}]},
++				{ifname: 'wlan0', addr_info: [{local: '169.254.13.7', scope: 'link'}]},
++				{ifname: 'end0', addr_info: [{local: '192.168.1.43', scope: 'global'}]},
++			]),
++		})
++		await expect(getIpAddresses()).resolves.toEqual(['192.168.1.43'])
++		expect(commands).toEqual(['nsenter --target 1 --net ip -json -4 address show'])
++	})
++
++	test('should never report the container address when the host namespace is unreadable', async () => {
++		process.env.UMBREL_CONTAINER_NAME = 'umbrel'
++		const commands = mockDockerCommands({exitCode: 1, stdout: ''})
++		vi.spyOn(os, 'networkInterfaces').mockReturnValue({
++			eth0: [{address: '10.21.0.2', family: 'IPv4', internal: false}],
++			eth1: [{address: '192.168.1.50', family: 'IPv4', internal: false}],
++			docker0: [{address: '172.17.0.1', family: 'IPv4', internal: false}],
++			lo: [{address: '127.0.0.1', family: 'IPv4', internal: true}],
++		} as any)
++		await expect(getIpAddresses()).resolves.toEqual(['192.168.1.50'])
++		expect(commands).toEqual(['nsenter --target 1 --net ip -json -4 address show'])
++	})
++
++	test('should report the device interfaces unchanged outside Docker', async () => {
++		delete process.env.UMBREL_CONTAINER_NAME
++		const commands = mockDockerCommands()
++		vi.spyOn(os, 'networkInterfaces').mockReturnValue({
++			end0: [{address: '192.168.1.43', family: 'IPv4', internal: false}],
++		} as any)
++		await expect(getIpAddresses()).resolves.toEqual(['192.168.1.43'])
++		expect(commands).toEqual([])
++	})
++})
++
+ describe('shutdown', () => {
+ 	const containerName = process.env.UMBREL_CONTAINER_NAME
+ 
