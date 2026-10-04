@@ -84,11 +84,15 @@ docker run -it --rm --name umbrel --pid=host --privileged -p 80:80 -p 443:443 -p
 
 ### Do I need `privileged: true`?
 
-  Only for Machines (virtual machines): libvirt needs it to create the virtual network and QEMU uses `/dev/kvm`. Without it, umbrelOS runs normally and hides Machines. For hardware acceleration, enable virtualization (Intel VT-x or AMD-V) in the BIOS of the host.
+  For Machines (virtual machines) it is required: libvirt needs it to create the virtual network and QEMU uses `/dev/kvm`. For hardware acceleration, enable virtualization (Intel VT-x or AMD-V) in the BIOS of the host.
+
+  It is also required for umbrelOS to advertise the host's LAN address. Reading the host interfaces from inside the container needs `CAP_SYS_ADMIN`, and without `privileged: true` the dashboard and the generated certificate fall back to the container's own Docker address (something like `172.17.0.2`), which no LAN client can reach or validate against. Adding `--cap-add SYS_ADMIN` is not enough here, the container has to be fully privileged. Without it umbrelOS otherwise runs normally and hides Machines.
 
 ### How do I upgrade from umbrelOS 1.x?
 
   Stop the container, back up the data folder, then pull the new image and start it again with the same `/data` folder. umbrelOS 2.0 updates the app configurations on its first start, so going back to 1.x requires the backup.
+
+  The container has to be recreated rather than just restarted with the new image: umbrelOS 2.0 requires host PID mode and exits with `Host PID mode is required` when it is missing, so add `pid: host` (and `privileged: true`, see above) to your existing command or compose file. A 1.x container that ran without them will not start on 2.0.
 
 ### How do I run CasaOS in a container?
 
